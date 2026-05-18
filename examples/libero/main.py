@@ -1,9 +1,17 @@
+import os
+import sys
+os.environ["MUJOCO_GL"] = "egl"
+os.environ["PYOPENGL_PLATFORM"] = "egl"
+os.environ["MUJOCO_EGL_DEVICE_ID"] = "8"
+LIBERO_REPO = "/home/chengyuxuan/openpi/third_party/libero"
+if LIBERO_REPO not in sys.path:
+    sys.path.insert(0, LIBERO_REPO)
+
 import collections
 import dataclasses
 import logging
 import math
 import pathlib
-
 import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
@@ -13,6 +21,32 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+import OpenGL.raw.EGL._errors as _egl_errors
+_orig_mj_del = None
+_orig_egl_del = None
+
+def _patch_mujoco_egl_cleanup():
+    global _orig_mj_del, _orig_egl_del
+    import robosuite.utils.binding_utils as _binding
+    import robosuite.renderers.context.egl_context as _egl_ctx
+    def _safe_mj_del(self):
+        try:
+            _orig_mj_del(self)
+        except _egl_errors.EGLError:
+            pass
+    def _safe_egl_del(self):
+        try:
+            _orig_egl_del(self)
+        except _egl_errors.EGLError:
+            pass
+
+    _orig_mj_del = _binding.MjRenderContext.__del__
+    _orig_egl_del = _egl_ctx.EGLGLContext.__del__
+    _binding.MjRenderContext.__del__ = _safe_mj_del
+    _egl_ctx.EGLGLContext.__del__ = _safe_egl_del
+
+_patch_mujoco_egl_cleanup()
+del _patch_mujoco_egl_cleanup
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -32,10 +66,10 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    num_trials_per_task: int = 1  # Number of rollouts per task
 
     #################################################################################################################
     # Utils

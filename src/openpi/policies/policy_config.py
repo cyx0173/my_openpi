@@ -22,6 +22,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    quantize: bool = False,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -53,12 +54,15 @@ def create_trained_policy(
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+        if quantize:
+            from openpi.models_pytorch.quant import enable_openpi_duquant_all_linears
+            enable_openpi_duquant_all_linears(model) #线形层量化 
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    # Load norm_stats from checkpoint/assets directly, bypassing data_config's _load_norm_stats
+    # which would try the local assets_dir first (causing a spurious "not found" warning).
     if norm_stats is None:
-        # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
-        # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
@@ -71,7 +75,7 @@ def create_trained_policy(
             pytorch_device = "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             pytorch_device = "cpu"
-
+    
     return _policy.Policy(
         model,
         transforms=[

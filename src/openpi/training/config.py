@@ -196,7 +196,7 @@ class DataConfigFactory(abc.ABC):
             logging.info(f"Loaded norm stats from {data_assets_dir}")
             return norm_stats
         except FileNotFoundError:
-            logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+            logging.debug(f"Norm stats not found in {data_assets_dir}, skipping.")
         return None
 
 
