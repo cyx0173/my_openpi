@@ -3,7 +3,8 @@ import logging
 import pathlib
 import time
 from typing import Any, TypeAlias
-
+import numpy as np
+import logging
 import flax
 import flax.traverse_util
 import jax
@@ -67,6 +68,8 @@ class Policy(BasePolicy):
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
+        obs = dict(obs)
+        vlm_feature_request = obs.pop("__vlm_feature_request__", None)
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
@@ -81,13 +84,20 @@ class Policy(BasePolicy):
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
+            noise = np.array(noise, dtype=np.float32, copy=True)
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        elif "noise" in self._sample_kwargs:
+            logging.warning("No noise provided to infer method. Inference may be non-deterministic if the policy relies on noise.")
+        else:
+            logging.warning("No noise provided to infer method, and no default noise in sample_kwargs. Inference may be non-deterministic if the policy relies on noise.")
 
         observation = _model.Observation.from_dict(inputs)
+        if vlm_feature_request is not None:
+            sample_kwargs["vlm_feature_request"] = vlm_feature_request
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
@@ -100,6 +110,15 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        model_obj = getattr(self, "_model", None)
+        if model_obj is None:
+            model_obj = getattr(self, "model", None)
+
+        meta = getattr(model_obj, "_last_vlm_feature_meta", None)
+        if meta is not None:
+            outputs["vlm_feature_path"] = meta.get("path", "")
+            outputs["vlm_feature_meta"] = meta
+
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

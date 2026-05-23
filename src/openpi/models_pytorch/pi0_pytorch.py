@@ -1,15 +1,16 @@
 import logging
 import math
-
+import os
 import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
-
+import json
+import pathlib
+import numpy as np
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -20,7 +21,6 @@ def get_safe_dtype(target_dtype, device_type):
         if target_dtype == torch.float64:
             return torch.float64
     return target_dtype
-
 
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
@@ -372,15 +372,109 @@ class PI0Pytorch(nn.Module):
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
+    def _save_vlm_hidden_if_requested(
+        self,
+        *,
+        vlm_feature_request,
+        observation,
+        prefix_pad_masks,
+        prefix_att_masks,
+        prefix_position_ids,
+    ):
+        if not isinstance(vlm_feature_request, dict):
+            self._last_vlm_feature_meta = None
+            return
+
+        if not vlm_feature_request.get("enabled", False):
+            self._last_vlm_feature_meta = None
+            return
+
+        save_path = vlm_feature_request.get("save_path", "")
+        hidden_states = getattr( self.paligemma_with_expert, "_last_vlm_hidden_states", None,)
+        if hidden_states is None:
+            raise RuntimeError(
+                "VLM hidden feature requested, but _last_vlm_hidden_states is None. "
+                "Check output_hidden_states=True in paligemma_with_expert.forward()."
+            )
+        num_vlm_layers = len(
+            self.paligemma_with_expert.paligemma.language_model.layers
+        )
+
+        if len(hidden_states) == num_vlm_layers + 1:
+            layer_hidden_states = hidden_states[1:]
+            has_embedding_hidden = True
+            embedding_hidden = hidden_states[0]
+        else:
+            layer_hidden_states = hidden_states
+            has_embedding_hidden = False
+            embedding_hidden = None
+
+        hidden_np = torch.stack(
+            [
+                h.detach().to(dtype=torch.float16).cpu()
+                for h in layer_hidden_states
+            ],
+            dim=0,
+        ).numpy()
+
+        save_path = pathlib.Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        metadata = dict(vlm_feature_request.get("metadata", {}))
+        metadata.update(
+            {
+                "tag": str(vlm_feature_request.get("tag", "")),
+                "mode": str(vlm_feature_request.get("mode", "full_tokens")),
+                "dtype": str(vlm_feature_request.get("dtype", "float16")),
+                "num_layers": int(hidden_np.shape[0]),
+                "hidden_shape": list(hidden_np.shape),
+                "has_embedding_hidden": bool(has_embedding_hidden),
+            }
+        )
+
+        arrays = {
+            "hidden": hidden_np,
+            "prefix_pad_masks": prefix_pad_masks.detach().cpu().numpy(),
+            "prefix_att_masks": prefix_att_masks.detach().cpu().numpy(),
+            "prefix_position_ids": prefix_position_ids.detach().cpu().numpy(),
+            "metadata_json": np.array(json.dumps(metadata, ensure_ascii=False)),
+            "tag": np.array(str(vlm_feature_request.get("tag", ""))),
+            "mode": np.array(str(vlm_feature_request.get("mode", "full_tokens"))),
+        }
+
+        if hasattr(observation, "state") and observation.state is not None:
+            arrays["observation_state"] = observation.state.detach().cpu().numpy()
+
+        if embedding_hidden is not None and vlm_feature_request.get(
+            "save_embedding_hidden", False
+        ):
+            arrays["embedding_hidden"] = (
+                embedding_hidden.detach().to(dtype=torch.float16).cpu().numpy()
+            )
+
+        np.savez_compressed(save_path, **arrays)
+
+        self._last_vlm_feature_meta = {
+            "path": str(save_path),
+            "num_layers": int(hidden_np.shape[0]),
+            "hidden_shape": list(hidden_np.shape),
+            "dtype": str(hidden_np.dtype),
+            "tag": str(vlm_feature_request.get("tag", "")),
+            "mode": str(vlm_feature_request.get("mode", "full_tokens")),
+            "metadata": metadata,
+        }
+
+        self.paligemma_with_expert._last_vlm_hidden_states = None
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10,vlm_feature_request=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        self._last_vlm_feature_meta = None
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
-
+        
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
@@ -390,6 +484,10 @@ class PI0Pytorch(nn.Module):
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        want_vlm_hidden = (
+            isinstance(vlm_feature_request, dict)
+            and vlm_feature_request.get("enabled", False)
+        )
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -397,6 +495,15 @@ class PI0Pytorch(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
+            output_hidden_states=want_vlm_hidden,
+        )
+        
+        self._save_vlm_hidden_if_requested(
+            vlm_feature_request=vlm_feature_request,
+            observation=observation,
+            prefix_pad_masks=prefix_pad_masks,
+            prefix_att_masks=prefix_att_masks,
+            prefix_position_ids=prefix_position_ids,
         )
 
         dt = -1.0 / num_steps

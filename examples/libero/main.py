@@ -6,7 +6,7 @@ os.environ["MUJOCO_EGL_DEVICE_ID"] = "8"
 LIBERO_REPO = "/home/chengyuxuan/openpi/third_party/libero"
 if LIBERO_REPO not in sys.path:
     sys.path.insert(0, LIBERO_REPO)
-
+import time
 import collections
 import dataclasses
 import logging
@@ -21,9 +21,16 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+import json
 import OpenGL.raw.EGL._errors as _egl_errors
 _orig_mj_del = None
 _orig_egl_del = None
+
+def _append_action_chunk_jsonl(path, record):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def _patch_mujoco_egl_cleanup():
     global _orig_mj_del, _orig_egl_del
@@ -176,6 +183,25 @@ def eval_libero(args: Args) -> None:
 
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
+                        action_chunk_np = np.asarray(action_chunk)
+
+                        _append_action_chunk_jsonl(
+                            "/home/chengyuxuan/openpi/lab_track/atm_1/action_chunks_1.jsonl",
+                            {
+                                "timestamp": time.time(),
+                                "task_description": task_description,
+                                "task_id": int(task_id) if "task_id" in locals() else None,
+                                "episode_idx": int(episode_idx) if "episode_idx" in locals() else None,
+                                "step": int(t) if "t" in locals() else None,
+                                "chunk_idx": int(t - args.num_steps_wait),
+                                "policy_tag": "atm_ones",  # 或者 "no_atm"
+                                "shape": list(action_chunk_np.shape),
+                                "mean": float(action_chunk_np.mean()),
+                                "std": float(action_chunk_np.std()),
+                                "abs_max": float(np.abs(action_chunk_np).max()),
+                                "actions": action_chunk_np.tolist(),
+                            },
+                        )
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."

@@ -2,7 +2,7 @@ import logging
 import os
 import pathlib
 from typing import Any
-
+import json
 import jax.numpy as jnp
 
 import openpi.models.model as _model
@@ -11,8 +11,7 @@ import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
-
-
+from openpi.policies.quantvla import _enable_pi05_atm_capture_jsonl_if_configured, _enable_pi05_ohb_capture_jsonl_if_configured, _enable_openpi_duquant_staged
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -55,8 +54,36 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
         if quantize:
-            from openpi.models_pytorch.quant import enable_openpi_duquant_all_linears
-            enable_openpi_duquant_all_linears(model) #线形层量化 
+            _enable_openpi_duquant_staged(model)
+        _enable_pi05_atm_capture_jsonl_if_configured(model)
+        _enable_pi05_ohb_capture_jsonl_if_configured(model)
+        from openpi.models_pytorch.atm import (
+            enable_pi05_atm_if_configured,
+            enable_pi05_atm_alpha_ones,
+            enable_pi05_ohb_if_configured,
+            enable_pi05_ohb_beta_ones,
+            enable_pi05_ohb_beta_constant,
+        )
+        if os.environ.get("OPENPI_ATM_ALPHA_ONES", "0") == "1":
+            enable_pi05_atm_alpha_ones(
+                model,
+                scope=os.environ.get("OPENPI_ATM_SCOPE", "gemma_expert"),
+            )
+        else:
+            enable_pi05_atm_if_configured(model)
+        if os.environ.get("OPENPI_OHB_BETA_ONES", "0") == "1":
+            enable_pi05_ohb_beta_ones(
+                model,
+                scope=os.environ.get("OPENPI_OHB_SCOPE", "gemma_expert"),
+            )
+        elif os.environ.get("OPENPI_OHB_BETA_CONSTANT", "") != "":
+            enable_pi05_ohb_beta_constant(
+                model,
+                beta=float(os.environ["OPENPI_OHB_BETA_CONSTANT"]),
+                scope=os.environ.get("OPENPI_OHB_SCOPE", "gemma_expert"),
+            )
+        else:
+            enable_pi05_ohb_if_configured(model)
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)

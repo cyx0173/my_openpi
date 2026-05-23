@@ -225,7 +225,40 @@ def _gated_residual(x, y, gate):
     if gate is None:
         return x + y
     return x + y * gate
+def _openpi_compute_rms_per_head(tensor: torch.Tensor) -> torch.Tensor:
+    t = tensor.detach().to(torch.float32)
+    return torch.sqrt(torch.mean(t ** 2, dim=(0, 2, 3)) + 1e-12).detach()
 
+def _openpi_compute_masked_logits_std(
+    logits: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    key_len: int,
+) -> torch.Tensor:
+    """
+    Compute per-head std of pre-softmax attention logits.
+
+    logits shape: (B, H, Q, K)
+    return shape: (B, H)
+    """
+    logits_f = logits.detach().to(torch.float32)
+
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, :key_len]
+        valid = causal_mask >= -1e4
+        valid = valid.expand_as(logits_f)
+    else:
+        valid = torch.ones_like(logits_f, dtype=torch.bool)
+
+    valid_f = valid.to(torch.float32)
+    count = valid_f.sum(dim=(-1, -2)).clamp_min(1.0)
+
+    mean = (logits_f * valid_f).sum(dim=(-1, -2)) / count
+    mean = mean.unsqueeze(-1).unsqueeze(-1)
+
+    var = ((logits_f - mean) ** 2 * valid_f).sum(dim=(-1, -2)) / count
+    std = torch.sqrt(var.clamp_min(1e-12))
+
+    return std.detach()
 
 def eager_attention_forward(
     module: nn.Module,
@@ -240,14 +273,83 @@ def eager_attention_forward(
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    # Raw pre-softmax logits before mask and before ATM scaling.
+    # Shape: (B, num_attention_heads, query_len, key_len)
+    attn_logits = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+
+    # ------------------------------------------------------------
+    # OpenPI PI0.5 ATM: capture logits statistics before scaling.
+    # This is used during calibration to compare FP16 teacher vs
+    # quantized student per-head logits std.
+    # ------------------------------------------------------------
+    capture_cb = getattr(module, "_atm_capture_callback", None)
+    logits_capture_cb = getattr(module, "_atm_logits_capture_callback", None)
+
+    if capture_cb is not None or logits_capture_cb is not None:
+        std = _openpi_compute_masked_logits_std(
+            attn_logits,
+            attention_mask,
+            key_states.shape[-2],
+        )
+
+        if capture_cb is not None:
+            capture_cb(module, std)
+
+        # Debug only: full logits can be very large.
+        if logits_capture_cb is not None:
+            logits_capture_cb(module, attn_logits.detach())
+
+    # ------------------------------------------------------------
+    # OpenPI PI0.5 ATM: apply per-head attention temperature scaling.
+    # alpha shape: (num_attention_heads,)
+    # attn_logits shape: (B, H, Q, K)
+    # Equivalent to Q *= alpha before QK^T.
+    # ------------------------------------------------------------
+    alpha = getattr(module, "_atm_alpha_all", None)
+    if alpha is not None:
+        alpha = alpha.to(dtype=attn_logits.dtype, device=attn_logits.device)
+
+        if alpha.numel() != attn_logits.shape[1]:
+            raise ValueError(
+                f"ATM alpha head mismatch: alpha has {alpha.numel()} heads, "
+                f"but attention logits have {attn_logits.shape[1]} heads. "
+                f"module={module.__class__.__name__}"
+            )
+
+        attn_logits = attn_logits * alpha.view(1, -1, 1, 1)
+
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+        attn_logits = attn_logits + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
+    attn_weights = nn.functional.softmax(
+        attn_logits,
+        dim=-1,
+        dtype=torch.float32,
+    ).to(query.dtype)
+
+    attn_weights = nn.functional.dropout(
+        attn_weights,
+        p=dropout,
+        training=module.training,
+    )
+
+    attn_output = torch.matmul(attn_weights, value_states)  # (B, H, Q, D)
+    ohb_perhead_capture_cb = getattr(module, "_atm_ohb_perhead_capture_callback", None)
+    if ohb_perhead_capture_cb is not None:
+        ohb_perhead_capture_cb(module, _openpi_compute_rms_per_head(attn_output))
+    beta_perhead = getattr(module, "_ohb_beta_perhead", None)
+    if beta_perhead is not None:
+        beta_perhead = beta_perhead.to(dtype=attn_output.dtype, device=attn_output.device)
+
+        if beta_perhead.numel() != attn_output.shape[1]:
+            raise ValueError(
+                f"OHB beta_perhead head mismatch: beta has {beta_perhead.numel()} heads, "
+                f"but attention output has {attn_output.shape[1]} heads. "
+                f"module={module.__class__.__name__}"
+            )
+
+        attn_output = attn_output * beta_perhead.view(1, -1, 1, 1)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
