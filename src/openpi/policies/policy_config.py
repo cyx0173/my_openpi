@@ -11,7 +11,8 @@ import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
-from openpi.policies.quantvla import _enable_pi05_atm_capture_jsonl_if_configured, _enable_pi05_ohb_capture_jsonl_if_configured, _enable_openpi_duquant_staged
+from openpi.policies.quantvla import _enable_openpi_duquant_staged, _debug_duquant_state
+from openpi.models_pytorch.quant import convert_duquant_to_packed_w4
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -53,37 +54,9 @@ def create_trained_policy(
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+
         if quantize:
             _enable_openpi_duquant_staged(model)
-        _enable_pi05_atm_capture_jsonl_if_configured(model)
-        _enable_pi05_ohb_capture_jsonl_if_configured(model)
-        from openpi.models_pytorch.atm import (
-            enable_pi05_atm_if_configured,
-            enable_pi05_atm_alpha_ones,
-            enable_pi05_ohb_if_configured,
-            enable_pi05_ohb_beta_ones,
-            enable_pi05_ohb_beta_constant,
-        )
-        if os.environ.get("OPENPI_ATM_ALPHA_ONES", "0") == "1":
-            enable_pi05_atm_alpha_ones(
-                model,
-                scope=os.environ.get("OPENPI_ATM_SCOPE", "gemma_expert"),
-            )
-        else:
-            enable_pi05_atm_if_configured(model)
-        if os.environ.get("OPENPI_OHB_BETA_ONES", "0") == "1":
-            enable_pi05_ohb_beta_ones(
-                model,
-                scope=os.environ.get("OPENPI_OHB_SCOPE", "gemma_expert"),
-            )
-        elif os.environ.get("OPENPI_OHB_BETA_CONSTANT", "") != "":
-            enable_pi05_ohb_beta_constant(
-                model,
-                beta=float(os.environ["OPENPI_OHB_BETA_CONSTANT"]),
-                scope=os.environ.get("OPENPI_OHB_SCOPE", "gemma_expert"),
-            )
-        else:
-            enable_pi05_ohb_if_configured(model)
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
@@ -123,3 +96,73 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
+
+'''
+#收益测试
+if os.environ.get("OPENPI_DUMP_QUANT_BENEFIT", "0") == "1":
+            from openpi.policies.quantvla import _dump_pi05_linear_quant_benefit
+
+            _dump_pi05_linear_quant_benefit(
+                model,
+                out_csv="/home/chengyuxuan/openpi/lab_track/quant_benefit/linear_quant_benefit.csv",
+                out_summary="/home/chengyuxuan/openpi/lab_track/quant_benefit/linear_quant_benefit_summary.txt",
+            )
+
+# atm & ohb 
+        _enable_pi05_atm_capture_jsonl_if_configured(model)
+        _enable_pi05_ohb_capture_jsonl_if_configured(model)
+
+        duquant_layout = os.environ.get("OPENPI_DUQUANT_LAYOUT", "quantvla_selective").strip()
+        disable_atm_ohb = os.environ.get("OPENPI_DISABLE_ATM_OHB", "0") == "1"
+
+        if duquant_layout.startswith("naive"):
+            disable_atm_ohb = True
+
+        if disable_atm_ohb:
+            print(
+                "[OPENPI] Skip ATM/OHB repair: "
+                f"OPENPI_DUQUANT_LAYOUT={duquant_layout}, "
+                f"OPENPI_DISABLE_ATM_OHB={os.environ.get('OPENPI_DISABLE_ATM_OHB', '0')}",
+                flush=True,
+            )
+        else:
+            from openpi.models_pytorch.atm import (
+                enable_pi05_atm_if_configured,
+                enable_pi05_atm_alpha_ones,
+                enable_pi05_ohb_if_configured,
+                enable_pi05_ohb_beta_ones,
+                enable_pi05_ohb_beta_constant,
+            )
+
+            if os.environ.get("OPENPI_ATM_ALPHA_ONES", "0") == "1":
+                enable_pi05_atm_alpha_ones(
+                    model,
+                    scope=os.environ.get("OPENPI_ATM_SCOPE", "gemma_expert"),
+                )
+            else:
+                enable_pi05_atm_if_configured(model)
+
+            if os.environ.get("OPENPI_OHB_BETA_ONES", "0") == "1":
+                enable_pi05_ohb_beta_ones(
+                    model,
+                    scope=os.environ.get("OPENPI_OHB_SCOPE", "gemma_expert"),
+                )
+            elif os.environ.get("OPENPI_OHB_BETA_CONSTANT", "") != "":
+                enable_pi05_ohb_beta_constant(
+                    model,
+                    beta=float(os.environ["OPENPI_OHB_BETA_CONSTANT"]),
+                    scope=os.environ.get("OPENPI_OHB_SCOPE", "gemma_expert"),
+                )
+            else:
+                enable_pi05_ohb_if_configured(model)
+
+        if quantize:
+            _debug_duquant_state(
+                model,
+                tag=(
+                    f"layout_{duquant_layout}_"
+                    f"mode_{os.environ.get('OPENPI_QUANT_MODE', 'unknown')}_"
+                    f"atmohb_disabled_{int(disable_atm_ohb)}"
+                ),
+            )
+'''

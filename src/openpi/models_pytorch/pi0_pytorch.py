@@ -466,8 +466,8 @@ class PI0Pytorch(nn.Module):
 
         self.paligemma_with_expert._last_vlm_hidden_states = None
 
-    @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10,vlm_feature_request=None) -> Tensor:
+    @torch.no_grad() 
+    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         self._last_vlm_feature_meta = None
         bsize = observation.state.shape[0]
@@ -484,26 +484,13 @@ class PI0Pytorch(nn.Module):
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        want_vlm_hidden = (
-            isinstance(vlm_feature_request, dict)
-            and vlm_feature_request.get("enabled", False)
-        )
-
+        
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
-            output_hidden_states=want_vlm_hidden,
-        )
-        
-        self._save_vlm_hidden_if_requested(
-            vlm_feature_request=vlm_feature_request,
-            observation=observation,
-            prefix_pad_masks=prefix_pad_masks,
-            prefix_att_masks=prefix_att_masks,
-            prefix_position_ids=prefix_position_ids,
         )
 
         dt = -1.0 / num_steps

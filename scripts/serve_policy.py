@@ -1,5 +1,33 @@
 import sys
 import os
+os.environ["OPENPI_DATA_HOME"] = "/share/chengyuxuan-local/openpi" #所有的文件不要乱放 全部放在这个/share文件夹下面
+#线形层量化
+os.environ.setdefault("OPENPI_DUQUANT_PACKDIR", "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_packed")  # SVD 分解缓存目录
+#os.environ["OPENPI_DUQUANT_STAGED"] = "1"  # Whether to quantize in stages (True) or all at once (False).
+os.environ.setdefault(
+    "OPENPI_DUQUANT_PACKDIR",
+    "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_packed",
+)
+os.environ["OPENPI_DUQUANT_LAYOUT"] = "naive_vlm_action_selective"
+os.environ["OPENPI_DUQUANT_INT4_CACHE_TAG"] = "default"
+os.environ["OPENPI_DUQUANT_WEIGHT_BACKEND"] = "fused_w4"
+os.environ["OPENPI_DUQUANT_PACKED_BACKEND"] = "kernel"
+os.environ["OPENPI_DUQUANT_FUSED_W4"] = "1"
+os.environ["OPENPI_DUQUANT_INT4_CACHE"] = "1"
+os.environ["OPENPI_DUQUANT_INT4_CACHE_DIR"] = (
+    "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_int4_cache"
+)
+os.environ["OPENPI_DUQUANT_PACKED_ACT_SCALE_MODE"] = "duquant_or_batch_amax"
+os.environ.setdefault("TRITON_CACHE_DIR", "/home/chengyuxuan/openpi/.triton_cache")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/home/chengyuxuan/openpi/.torchinductor_cache")
+# action model量化 atm ohb
+#os.environ["OPENPI_ATM_ENABLE"] = "0"
+#os.environ["OPENPI_ATM_ALPHA_PATH"] = "/tmp/pi05_atm_alpha_ones.json"
+#os.environ["OPENPI_ATM_SCOPE"] = "gemma_expert"
+#os.environ["OPENPI_ATM_ALPHA_ONES"] = "0"
+#os.environ["OPENPI_ATM_CAPTURE_TAG"] = "w4a8"
+#os.environ["OPENPI_ATM_CAPTURE_PATH"] = "/home/chengyuxuan/openpi/lab_track/atm_1/w4a8.jsonl"
+# OPENPI_ATM_CAPTURE_TAG和OPENPI_ATM_CAPTURE_PATH应用于函数_enable_pi05_atm_capture_jsonl_if_configured
 _openpi_src = "/home/chengyuxuan/openpi/src"
 if _openpi_src not in sys.path:
     sys.path.insert(0, _openpi_src)
@@ -14,20 +42,6 @@ from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
-
-os.environ["OPENPI_DATA_HOME"] = "/share/chengyuxuan-local/openpi" #所有的文件不要乱放 全部放在这个/share文件夹下面
-#线形层量化
-os.environ.setdefault("OPENPI_DUQUANT_PACKDIR", "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_packed")  # SVD 分解缓存目录
-#os.environ["OPENPI_DUQUANT_STAGED"] = "1"  # Whether to quantize in stages (True) or all at once (False).
-
-# action model量化 atm ohb
-#os.environ["OPENPI_ATM_ENABLE"] = "0"
-#os.environ["OPENPI_ATM_ALPHA_PATH"] = "/tmp/pi05_atm_alpha_ones.json"
-#os.environ["OPENPI_ATM_SCOPE"] = "gemma_expert"
-#os.environ["OPENPI_ATM_ALPHA_ONES"] = "0"
-#os.environ["OPENPI_ATM_CAPTURE_TAG"] = "w4a8"
-#os.environ["OPENPI_ATM_CAPTURE_PATH"] = "/home/chengyuxuan/openpi/lab_track/atm_1/w4a8.jsonl"
-# OPENPI_ATM_CAPTURE_TAG和OPENPI_ATM_CAPTURE_PATH应用于函数_enable_pi05_atm_capture_jsonl_if_configured
 class EnvMode(enum.Enum):
     """Supported environments."""
 
@@ -182,7 +196,7 @@ if __name__ == "__main__":
         "1": {"OPENPI_DUQUANT_DRYRUN": "0", "OPENPI_DUQUANT_WBITS_DEFAULT": "4", "OPENPI_DUQUANT_ABITS": "4"},  # W4A4
         "2": {"OPENPI_DUQUANT_DRYRUN": "0", "OPENPI_DUQUANT_WBITS_DEFAULT": "4", "OPENPI_DUQUANT_ABITS": "8"},  # W4A8
         "3": {"OPENPI_DUQUANT_DRYRUN": "0", "OPENPI_DUQUANT_WBITS_DEFAULT": "4", "OPENPI_DUQUANT_ABITS": "16"},  # W2A2
-        "4": {"OPENPI_DUQUANT_DRYRUN": "0", "OPENPI_DUQUANT_WBITS_DEFAULT": "4", "OPENPI_DUQUANT_ABITS": "8"},  # DRYRUN
+        "4": {"OPENPI_DUQUANT_DRYRUN": "0", "OPENPI_DUQUANT_WBITS_DEFAULT": "4", "OPENPI_DUQUANT_ABITS": "2"},  # DRYRUN
     }
     quant_mode = os.environ.get("OPENPI_QUANT_MODE", "0")
     for k, v in _QUANT_MODES.get(quant_mode, {}).items():

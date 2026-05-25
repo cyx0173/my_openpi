@@ -13,9 +13,13 @@ logger = logging.getLogger(__name__)
 
 
 class WebsocketPolicyServer:
-    """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
+    """Serves a policy using the websocket protocol.
 
-    Currently only implements the `load` and `infer` methods.
+    Clean benchmark version:
+      - no torch profiler
+      - no debug environment variables
+      - keeps server_timing in response
+      - disables server-side websocket keepalive pings
     """
 
     def __init__(
@@ -29,6 +33,7 @@ class WebsocketPolicyServer:
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        self._infer_count = 0
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -41,6 +46,9 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            ping_interval=None,
+            ping_timeout=None,
+            close_timeout=600,
             process_request=_health_check,
         ) as server:
             await server.serve_forever()
@@ -52,33 +60,37 @@ class WebsocketPolicyServer:
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None
+
         while True:
             try:
-                start_time = time.monotonic()
+                start_time = time.perf_counter()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
-                infer_time = time.monotonic()
+                infer_start = time.perf_counter()
+
                 noise = None
                 if isinstance(obs, dict):
                     noise = obs.pop("debug_noise", None)
-                if noise is None:
-                    logger.warning("No debug_noise found in the observation. Inference may be non-deterministic.")
+
+                self._infer_count += 1
                 action = self._policy.infer(obs, noise=noise)
-                infer_time = time.monotonic() - infer_time
+
+                infer_time = time.perf_counter() - infer_start
 
                 action["server_timing"] = {
-                    "infer_ms": infer_time * 1000,
+                    "infer_ms": infer_time * 1000.0,
+                    "infer_count": self._infer_count,
                 }
                 if prev_total_time is not None:
-                    # We can only record the last total time since we also want to include the send time.
-                    action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
+                    action["server_timing"]["prev_total_ms"] = prev_total_time * 1000.0
 
                 await websocket.send(packer.pack(action))
-                prev_total_time = time.monotonic() - start_time
+                prev_total_time = time.perf_counter() - start_time
 
             except websockets.ConnectionClosed:
                 logger.info(f"Connection from {websocket.remote_address} closed")
                 break
+
             except Exception:
                 await websocket.send(traceback.format_exc())
                 await websocket.close(
@@ -91,5 +103,4 @@ class WebsocketPolicyServer:
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:
     if request.path == "/healthz":
         return connection.respond(http.HTTPStatus.OK, "OK\n")
-    # Continue with the normal request handling.
     return None

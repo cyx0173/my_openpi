@@ -1,0 +1,18 @@
+{
+  "task_suite_name": "libero_10",
+  "task_ids": "0,1,2,3,4,5,6,7,8,9",
+  "episode_start": 0,
+  "episode_end": 10,
+  "seed": 7,
+  "replan_steps": 5,
+  "num_steps_wait": 10,
+  "max_steps": 320,
+  "precision": "w4a4",
+  "use_debug_noise": true,
+  "debug_noise_base_seed": 0,
+  "debug_noise_shape": [
+    10,
+    32
+  ],
+  "debug_noise_formula": "base_seed + chunk_idx"
+}
