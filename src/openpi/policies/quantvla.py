@@ -1,51 +1,59 @@
-
 #OPENPI_DUQUANT_LAYOUT=naive_vlm_action_selective 这里其实不应该传入这个环境变量 我们后面应该是默认第一种量化策略
 def _enable_openpi_duquant_staged(model):
-    """
-      - VLM paligemma.model.*
-      - action expert MLP + action_in_proj + time_mlp_in/out
-      - backend conversion: DuQuantLinear -> DuQuantFusedW4Linear
-
-    Runtime mode is controlled only by OPENPI_QUANT_MODE:
-      mode 1: W4A4
-      mode 2: W4A8
-      mode 3: W4A16
-    """
     import gc
     import os
+    import time
 
     import torch
 
     from openpi.models_pytorch.quant import enable_openpi_duquant_all_linears
 
-    # Hardcoded stable backend configuration.
     os.environ["OPENPI_DUQUANT_PACKDIR"] = "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_packed"
-    os.environ["OPENPI_DUQUANT_LAYOUT"] = "naive_vlm_action_selective"
     os.environ["OPENPI_DUQUANT_INT4_CACHE_TAG"] = "default"
-    os.environ["OPENPI_DUQUANT_WEIGHT_BACKEND"] = "fused_w4"
-    os.environ["OPENPI_DUQUANT_PACKED_BACKEND"] = "kernel"
-    os.environ["OPENPI_DUQUANT_FUSED_W4"] = "1"
     os.environ["OPENPI_DUQUANT_INT4_CACHE"] = "1"
     os.environ["OPENPI_DUQUANT_INT4_CACHE_DIR"] = (
         "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_int4_cache"
     )
-    os.environ["OPENPI_DUQUANT_PACKED_ACT_SCALE_MODE"] = "duquant_or_batch_amax"
-    os.environ.setdefault("TRITON_CACHE_DIR", "/home/chengyuxuan/openpi/.triton_cache")
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/home/chengyuxuan/openpi/.torchinductor_cache")
+
+    os.environ["OPENPI_DUQUANT_WEIGHT_BACKEND"] = "fused_w4"
+    os.environ["OPENPI_DUQUANT_PACKED_BACKEND"] = "kernel"
+    os.environ["OPENPI_DUQUANT_FUSED_W4"] = "1"
+
+    # Activation quantization:
+    #   W4A4/W4A8: stateless dynamic per-token absmax fake quant, FP32 internal.
+    #   W4A16: native BF16/FP16 activation, no activation fake quant.
+    os.environ.setdefault("OPENPI_DUQUANT_ACT_QUANT_MODE", "dynamic_token_amax")
+    os.environ.setdefault("OPENPI_DUQUANT_FAKEQ_INTERNAL", "fp32")
+    os.environ.setdefault("OPENPI_DUQUANT_ACT_BACKEND", "fake")
+    os.environ.setdefault("TRITON_CACHE_DIR", "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/.triton_cache")
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/.torchinductor_cache")
+
+    quant_mode = os.environ.get("OPENPI_QUANT_MODE", "unknown")
+    print(
+        "[OPENPI-DUQUANT] "
+        f"mode={quant_mode} "
+        "backend=fused_w4 "
+        f"act_quant_mode={os.environ['OPENPI_DUQUANT_ACT_QUANT_MODE']} "
+        f"int4_cache_tag={os.environ['OPENPI_DUQUANT_INT4_CACHE_TAG']}",
+        flush=True,
+    )
 
     def _cleanup(stage_name: str):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
-        print(f"[OPENPI-DUQUANT-STAGED] cleanup done after {stage_name}", flush=True)
+        print(f"[OPENPI-DUQUANT] cleanup after {stage_name}", flush=True)
+
+    def _count_duquant_linear() -> int:
+        from openpi.models_pytorch.quant.duquant_layers import DuQuantLinear
+
+        return sum(1 for m in model.modules() if isinstance(m, DuQuantLinear))
 
     def _run_stage(stage_name: str, include: str, exclude: str = ""):
-        print("\n" + "=" * 100, flush=True)
-        print(f"[OPENPI-DUQUANT-STAGED] Start {stage_name}", flush=True)
-        print(f"[OPENPI-DUQUANT-STAGED] INCLUDE={include}", flush=True)
-        print(f"[OPENPI-DUQUANT-STAGED] EXCLUDE={exclude}", flush=True)
-        print("=" * 100, flush=True)
+        print(f"[OPENPI-DUQUANT] start {stage_name}", flush=True)
+        t0 = time.perf_counter()
+        before = _count_duquant_linear()
 
         os.environ["OPENPI_DUQUANT_INCLUDE"] = include
         os.environ["OPENPI_DUQUANT_EXCLUDE"] = exclude
@@ -53,11 +61,13 @@ def _enable_openpi_duquant_staged(model):
         enable_openpi_duquant_all_linears(model)
         _cleanup(stage_name)
 
-    print(
-        "[OPENPI-DUQUANT-STAGED] fixed layout=naive_vlm_action_selective "
-        f"OPENPI_QUANT_MODE={os.environ.get('OPENPI_QUANT_MODE', 'unknown')}",
-        flush=True,
-    )
+        after = _count_duquant_linear()
+        print(
+            f"[OPENPI-DUQUANT] done {stage_name}: "
+            f"duquant_layers_before={before}, after={after}, "
+            f"added={after - before}, dt={time.perf_counter() - t0:.2f}s",
+            flush=True,
+        )
 
     common_exclude = (
         r"lm_head"
@@ -96,21 +106,22 @@ def _enable_openpi_duquant_staged(model):
         exclude=action_exclude,
     )
 
-    print("[OPENPI-DUQUANT-STAGED] All DuQuantLinear stages finished.", flush=True)
-    print("[OPENPI-DUQUANT-STAGED] converting DuQuantLinear -> DuQuantFusedW4Linear", flush=True)
+    print("[OPENPI-DUQUANT] converting DuQuantLinear -> DuQuantFusedW4Linear", flush=True)
+    t0 = time.perf_counter()
 
     from openpi.models_pytorch.quant.duquant_fused_w4 import convert_duquant_to_fused_w4
 
-    n = convert_duquant_to_fused_w4(model)
+    converted = convert_duquant_to_fused_w4(model)
+    _cleanup("fused_w4_conversion")
 
     print(
-        f"[OPENPI-DUQUANT-STAGED] fused_w4 conversion finished. converted_layers={n}",
+        f"[OPENPI-DUQUANT] fused_w4 converted_layers={converted}, "
+        f"dt={time.perf_counter() - t0:.2f}s",
         flush=True,
     )
 
-    _cleanup("fused_w4_conversion")
-
     return model
+
 
 def _debug_duquant_state(model, tag: str = "unknown"):
     from collections import Counter

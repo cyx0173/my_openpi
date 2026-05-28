@@ -17,13 +17,14 @@ start_server() {
   CUDA_VISIBLE_DEVICES="${gpu}" \
   OPENPI_QUANT_MODE="${mode}" \
   python scripts/serve_policy.py --port "${port}" --quantize \
-    > "${LOG_DIR}/device_${gpu}.log" 2>&1 &
+    > "${LOG_DIR}/${tag}.log" 2>&1 &
 }
 
-#start_server 8002 2 1 w4a4
-#start_server 8003 3 2 w4a8
-#start_server 8004 4 3 w4a16
-#320steps
-start_server 8000 0 1 w4a4
-start_server 8001 1 1 w4a4
+# start_server 8002 2 1 w4a4
+# start_server 8003 3 2 w4a8
+# start_server 8004 4 3 w4a16
+#420steps
+start_server 8005 5 1 w4a4
+start_server 8006 6 2 w4a8
+start_server 8007 7 3 w4a16
 ps -ef | grep "scripts/serve_policy.py" | grep -v grep || true

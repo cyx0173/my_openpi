@@ -90,20 +90,66 @@ def fake_quantize_sym(
     label: Optional[str] = None,
 ) -> torch.Tensor:
     """
-    Symmetric fake quant:
-        x -> round(x / scale) -> clamp -> dequantize back to float
+    Symmetric fake quantization used for weight quantization.
+
+    Quantize/dequantize arithmetic is always executed in FP32 to avoid BF16/FP16
+    round(x / scale) artifacts. The returned tensor keeps the original dtype.
+    """
+    if bits <= 0:
+        return x
+
+    def _impl() -> torch.Tensor:
+        max_q = qmax(bits)
+        x_fp32 = x.to(torch.float32)
+        scale_safe = torch.clamp(
+            scale.to(device=x.device, dtype=torch.float32),
+            min=1e-12,
+        )
+        q = torch.round(x_fp32 / scale_safe)
+        q = torch.clamp(q, -max_q - 1, max_q)
+        y = q * scale_safe
+        return y.to(dtype=x.dtype)
+
+    return _DUQUANT_PROFILER.record(label or "fake_quantize_sym", x, scale, bits, _impl)
+
+
+def fake_quantize_act_dynamic(
+    x: torch.Tensor,
+    bits: int,
+    *,
+    mode: str = "dynamic_token_amax",
+    label: Optional[str] = None,
+) -> torch.Tensor:
+    """
+    Stateless dynamic activation fake quantization.
+
+    Mainline mode:
+      dynamic_token_amax / token_amax / per_token_amax
+
+    Semantics:
+      - A4/A8 use per-token absmax scale computed from the current activation.
+      - Quantize/dequantize arithmetic is FP32.
+      - A16 and higher bypass activation fake quantization.
+      - No calibration buffer, running scale, or first-request cache is used.
     """
     if bits <= 0 or bits >= 16:
         return x
 
     def _impl() -> torch.Tensor:
-        max_q = qmax(bits)
-        scale_safe = torch.clamp(scale.to(device=x.device, dtype=x.dtype), min=1e-8)
-        q = torch.round(x / scale_safe)
-        q = torch.clamp(q, -max_q - 1, max_q)
-        return q * scale_safe
+        mode_l = str(mode).strip().lower()
+        if mode_l not in {"dynamic_token_amax", "token_amax", "per_token_amax"}:
+            raise ValueError(f"Unknown OPENPI_DUQUANT_ACT_QUANT_MODE={mode}")
 
-    return _DUQUANT_PROFILER.record(label or "fake_quantize_sym", x, scale, bits, _impl)
+        max_q = qmax(bits)
+        x_fp32 = x.to(torch.float32)
+        p = torch.amax(torch.abs(x_fp32), dim=-1, keepdim=True)
+        scale = torch.clamp(p / max_q, min=1e-12)
+        q = torch.round(x_fp32 / scale)
+        q = torch.clamp(q, -max_q - 1, max_q)
+        y = q * scale
+        return y.to(dtype=x.dtype)
+
+    return _DUQUANT_PROFILER.record(label or "fake_quantize_act_dynamic", x, x, bits, _impl)
 
 
 @dataclass
@@ -113,43 +159,6 @@ class PackResult:
     R_out_blocks: Optional[Dict[int, np.ndarray]]
     weight_scale: np.ndarray
     meta: Dict[str, Any]
-
-
-class PercentileCalibrator:
-    """
-    Collects per-channel activation percentile over several batches.
-    """
-
-    def __init__(self, percentile: float = 99.9, max_batches: int = 32) -> None:
-        self.percentile = percentile
-        self.max_batches = max_batches
-        self._seen = 0
-        self._p_running: Optional[torch.Tensor] = None
-
-    def observe(self, x: torch.Tensor) -> None:
-        if self._seen >= self.max_batches:
-            return
-
-        x_abs = torch.abs(x.detach().to(torch.float32))
-        c = x_abs.shape[-1]
-        x2d = x_abs.reshape(-1, c)
-        q = torch.quantile(x2d, self.percentile / 100.0, dim=0)
-        q = torch.clamp(q, min=1e-6).cpu()
-
-        if self._p_running is None:
-            self._p_running = q
-        else:
-            self._p_running = torch.maximum(self._p_running, q)
-
-        self._seen += 1
-
-    def is_full(self) -> bool:
-        return self._seen >= self.max_batches
-
-    def finalize(self) -> torch.Tensor:
-        if self._p_running is None:
-            return torch.tensor([1.0], dtype=torch.float32)
-        return self._p_running
 
 
 def _block_count(dim: int, block_size: int) -> int:

@@ -3,23 +3,8 @@ import os
 os.environ["OPENPI_DATA_HOME"] = "/share/chengyuxuan-local/openpi" #所有的文件不要乱放 全部放在这个/share文件夹下面
 #线形层量化
 os.environ.setdefault("OPENPI_DUQUANT_PACKDIR", "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_packed")  # SVD 分解缓存目录
+os.environ["OPENPI_DUQUANT_ACT_SCALE_MODE"] = "dynamic_amax"
 #os.environ["OPENPI_DUQUANT_STAGED"] = "1"  # Whether to quantize in stages (True) or all at once (False).
-os.environ.setdefault(
-    "OPENPI_DUQUANT_PACKDIR",
-    "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_packed",
-)
-os.environ["OPENPI_DUQUANT_LAYOUT"] = "naive_vlm_action_selective"
-os.environ["OPENPI_DUQUANT_INT4_CACHE_TAG"] = "default"
-os.environ["OPENPI_DUQUANT_WEIGHT_BACKEND"] = "fused_w4"
-os.environ["OPENPI_DUQUANT_PACKED_BACKEND"] = "kernel"
-os.environ["OPENPI_DUQUANT_FUSED_W4"] = "1"
-os.environ["OPENPI_DUQUANT_INT4_CACHE"] = "1"
-os.environ["OPENPI_DUQUANT_INT4_CACHE_DIR"] = (
-    "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_int4_cache"
-)
-os.environ["OPENPI_DUQUANT_PACKED_ACT_SCALE_MODE"] = "duquant_or_batch_amax"
-os.environ.setdefault("TRITON_CACHE_DIR", "/home/chengyuxuan/openpi/.triton_cache")
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/home/chengyuxuan/openpi/.torchinductor_cache")
 # action model量化 atm ohb
 #os.environ["OPENPI_ATM_ENABLE"] = "0"
 #os.environ["OPENPI_ATM_ALPHA_PATH"] = "/tmp/pi05_atm_alpha_ones.json"
@@ -211,6 +196,6 @@ if __name__ == "__main__":
     main(tyro.cli(Args))
 
 '''
-如果需要指定参数 环境变量指定具体的东西替换   OPENPI_QUANT_MODE=2 
+如果需要指定参数 环境变量指定具体的东西替换   OPENPI_QUANT_MODE=2   OPENPI_DUQUANT_ACT_BACKEND=real
 CUDA_VISIBLE_DEVICES=0   python scripts/serve_policy.py     --port 8000     --quantize     policy:checkpoint     --policy.config pi05_libero     --policy.dir /share/chengyuxuan-local/openpi/openpi-assets/checkpoints/pi05_libero_pytorch
 '''

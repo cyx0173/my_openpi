@@ -166,3 +166,29 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# generated / cache / experiment artifacts
+.kernels/
+tmp/
+rubbish/
+lab_track/
+MUJOCO_LOG.TXT
+
+*.so
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+*.qdrep
+*.qdstrm
+
+__pycache__/
+.triton_cache/
+**/.triton_cache/
+**/duquant_int4_cache/
+**/duquant_packed/
+
+# experiment data
+experiments/baseline/
+experiments/**/w4a4_action_bank/
+experiments/**/videos/
+experiments/**/logs/

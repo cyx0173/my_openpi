@@ -11,11 +11,11 @@ from torch import nn
 
 from .duquant_preprocess import (
     PackResult,
-    PercentileCalibrator,
     apply_bias_row_rot_optimized,
     apply_input_transform_optimized,
     apply_output_restore_optimized,
     fake_quantize_sym,
+    fake_quantize_act_dynamic,
     load_pack,
     pack_weight,
     qmax,
@@ -154,13 +154,6 @@ class DuQuantLinear(nn.Module):
         self._block_size = int(pack.meta.get("block_size", cfg.block_size))
         self._block_out_size = int(pack.meta.get("block_out_size", cfg.block_out_size))
 
-        self.calibrator = (
-            PercentileCalibrator(percentile=cfg.act_percentile, max_batches=cfg.calib_batches)
-            if self.act_bits > 0
-            else None
-        )
-        self.register_buffer("_act_percentile_vec", torch.empty(0, dtype=torch.float32))
-
         self.register_buffer("_W_t", torch.zeros_like(self._weight))
         self.register_buffer("_w_scales", torch.ones(self.out_features, dtype=self._weight.dtype))
         self.register_buffer("_W_t_quantized", torch.zeros_like(self._weight))
@@ -168,9 +161,6 @@ class DuQuantLinear(nn.Module):
         self._cached_weight_key: Optional[Tuple[str, torch.dtype, int, int]] = None
         self._weight_quantized_cached = False
         self._bias_rot: Optional[torch.Tensor] = None
-
-        self._debug_enabled = os.environ.get("OPENPI_DUQUANT_DEBUG", "0") not in ("0", "false", "False")
-        self._debug_forward_logged = False
 
     @property
     def weight(self) -> torch.Tensor:
@@ -235,32 +225,6 @@ class DuQuantLinear(nn.Module):
             self._bias_rot = None
 
         self._cached_weight_key = key
-
-    def _current_batch_percentile(self, x: torch.Tensor) -> torch.Tensor:
-        x_abs = torch.abs(x.detach().to(torch.float32))
-        c = x_abs.shape[-1]
-        x2d = x_abs.reshape(-1, c)
-        p = torch.quantile(x2d, self.cfg.act_percentile / 100.0, dim=0)
-        return torch.clamp(p, min=1e-6)
-
-    def _get_act_scale(self, x: torch.Tensor, bits: int) -> torch.Tensor:
-        if bits <= 0 or bits >= 16:
-            return torch.ones(x.shape[-1], dtype=x.dtype, device=x.device)
-
-        if self.calibrator is not None and not self.calibrator.is_full():
-            self.calibrator.observe(x)
-            if self.calibrator.is_full():
-                p_vec = self.calibrator.finalize().to(device=x.device, dtype=torch.float32)
-                self._act_percentile_vec = p_vec.detach().clone()
-
-        if self._act_percentile_vec.numel() == x.shape[-1]:
-            p_vec = self._act_percentile_vec.to(device=x.device, dtype=torch.float32)
-        else:
-            p_vec = self._current_batch_percentile(x)
-
-        scale = torch.clamp(p_vec / qmax(bits), min=1e-6)
-        return scale.to(dtype=x.dtype, device=x.device)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_t = apply_input_transform_optimized(
             x,
@@ -269,10 +233,17 @@ class DuQuantLinear(nn.Module):
             self._get_R_in_cache(),
             self._block_size,
         )
-
-        if self.act_bits > 0 and self.act_bits < 16:
-            s_a = self._get_act_scale(x_t, self.act_bits)
-            x_t = fake_quantize_sym(x_t, s_a, self.act_bits, label="activation_forward")
+        if self.act_bits > 0 and self.act_bits <= 16:
+            act_mode = os.environ.get(
+                "OPENPI_DUQUANT_ACT_QUANT_MODE",
+                "dynamic_token_amax",
+            ).strip().lower()
+            x_t = fake_quantize_act_dynamic(
+                x_t,
+                self.act_bits,
+                mode=act_mode,
+                label="activation_forward",
+            )
 
         self._maybe_update_weight_cache()
 
@@ -296,13 +267,6 @@ class DuQuantLinear(nn.Module):
         else:
             if self.bias is not None:
                 y = y + (self._bias_rot if self._bias_rot is not None else self.bias)
-
-        if self._debug_enabled and not self._debug_forward_logged:
-            print(
-                f"[OPENPI-DUQUANT][FORWARD] {self.name} "
-                f"input={tuple(x.shape)} output={tuple(y.shape)} W{self.weight_bits} A{self.act_bits}"
-            )
-            self._debug_forward_logged = True
 
         return y
 

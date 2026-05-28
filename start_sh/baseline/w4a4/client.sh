@@ -4,38 +4,34 @@ set -euo pipefail
 cd /home/chengyuxuan/openpi
 source start_sh/reset_path.sh
 
-BASE_DIR="/home/chengyuxuan/openpi/experiments/baseline/420steps"
+BASE_DIR="/home/chengyuxuan/openpi/experiments/baseline/320steps"
 LOG_DIR="$BASE_DIR/logs/client"
 mkdir -p "$LOG_DIR"
 
 run_one_task() {
   local port="$1"
   local tag="$2"
+  local task_id="$3"
+  local task_name="$4"
 
   {
-    echo "===== ${tag}: build action bank ====="
-    echo "Port: ${port}"
-    echo "Base dir: ${BASE_DIR}/${tag}"
-    echo "Log time: $(date)"
-    echo
 
-    uv run python recovery/mode3_accrute.py \
+    uv run python experiments/mode1_baseline.py \
       --args.port-w4a4 "$port" \
+      --args.task_ids "$task_id" \
       --args.episode-start 0 \
-      --args.episode-end 10 \
+      --args.episode-end 20 \
       --args.base-dir "$BASE_DIR/$tag"
 
-    echo
-    echo "===== ${tag}: finished at $(date) ====="
-  } > "$LOG_DIR/${tag}.log" 2>&1 &
+  } > "$LOG_DIR/${tag}_${task_name}.log" 2>&1 &
 }
 
-#run_one_task 8002 w4a4
-#run_one_task 8003 w4a8
-#run_one_task 8004 w4a16
-# cmd + / to toggle comments
-# run_one_task 8005 w4a4
-# run_one_task 8006 w4a8
-# run_one_task 8007 w4a16
+run_one_task 8002 w4a4 8 "put_both_moka_pots_on_the_stove"
+run_one_task 8003 w4a8 8 "put_both_moka_pots_on_the_stove"
+run_one_task 8004 w4a16 8 "put_both_moka_pots_on_the_stove"
+# cmd +
+run_one_task 8005 w4a4 9 "put_the_yellow_and_white_mug_in_the_microwave_and_close_it"
+run_one_task 8006 w4a8 9 "put_the_yellow_and_white_mug_in_the_microwave_and_close_it"
+run_one_task 8007 w4a16 9 "put_the_yellow_and_white_mug_in_the_microwave_and_close_it"
 
-ps -ef | grep "recovery/mode3_data.py" | grep -v grep || true
+ps -ef | grep "experiments/mode1_baseline.py" | grep -v grep || true

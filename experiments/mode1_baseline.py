@@ -74,7 +74,7 @@ _MAX_STEPS = {
     "libero_spatial": 220,
     "libero_object": 280,
     "libero_goal": 300,
-    "libero_10": 320,
+    "libero_10": 600,
     "libero_90": 400,
 }
 
@@ -100,7 +100,7 @@ class Args:
     debug_noise_dim: int = 32
 
     base_dir: str = "/home/chengyuxuan/openpi/recovery/mode3"
-    skip_existing: bool = True
+    skip_existing: bool = False
 
 
 class _NumpyEncoder(json.JSONEncoder):
@@ -187,7 +187,12 @@ def _resolve_episode_indices(args: Args, num_initial_states: int):
 
 
 def _make_debug_noise(args: Args, task_id: int, episode_idx: int, chunk_idx: int):
-    noise_seed = int(args.debug_noise_base_seed) + int(chunk_idx)
+    noise_seed = (
+        int(args.debug_noise_base_seed)
+        + int(task_id) * 100000
+        + int(episode_idx) * 1000
+        + int(chunk_idx)
+    )
 
     rng = np.random.default_rng(noise_seed)
     noise = rng.standard_normal(
@@ -208,7 +213,7 @@ def _add_debug_noise(element: dict, args: Args, task_id: int, episode_idx: int, 
     noise_seed, debug_noise = _make_debug_noise(args, task_id, episode_idx, chunk_idx)
 
     out = dict(element)
-    out["debug_noise"] = debug_noise.copy()
+    #out["debug_noise"] = debug_noise.copy()
 
     return out, {
         "enabled": True,
@@ -240,7 +245,7 @@ def _run_w4a4_episode(
     action_plan = collections.deque()
     chunks = []
 
-    max_steps = _MAX_STEPS.get(args.task_suite_name, 320)
+    max_steps = _MAX_STEPS.get(args.task_suite_name, 600)
 
     while t < max_steps + args.num_steps_wait:
         if t < args.num_steps_wait:
@@ -315,7 +320,7 @@ def eval_libero(args: Args) -> None:
                 "seed": int(args.seed),
                 "replan_steps": int(args.replan_steps),
                 "num_steps_wait": int(args.num_steps_wait),
-                "max_steps": int(_MAX_STEPS.get(args.task_suite_name, 320)),
+                "max_steps": int(_MAX_STEPS.get(args.task_suite_name, 600)),
                 "precision": "w4a4",
                 "use_debug_noise": bool(args.use_debug_noise),
                 "debug_noise_base_seed": int(args.debug_noise_base_seed),
@@ -323,7 +328,7 @@ def eval_libero(args: Args) -> None:
                     int(args.debug_noise_horizon),
                     int(args.debug_noise_dim),
                 ],
-                "debug_noise_formula": "base_seed + chunk_idx",
+                "debug_noise_formula": "base_seed + task_id * 100000 + episode_idx * 1000 + chunk_idx",
             },
             f,
             indent=2,

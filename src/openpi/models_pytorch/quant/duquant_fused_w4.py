@@ -1,12 +1,12 @@
 from __future__ import annotations
-
+import os
 import gc
 import time
 from typing import Optional
 
 import torch
 from torch import nn
-
+from openpi.models_pytorch.quant.duquant_real_w4a import real_w4a_linear_triton
 try:
     import triton
     import triton.language as tl
@@ -21,7 +21,7 @@ except Exception:
 from openpi.models_pytorch.quant.duquant_layers import DuQuantLinear
 from openpi.models_pytorch.quant.duquant_preprocess import (
     apply_input_transform_optimized,
-    fake_quantize_sym,
+    fake_quantize_act_dynamic,
 )
 from openpi.models_pytorch.quant.duquant_packed_w4 import (
     DuQuantPackedW4Linear,
@@ -417,11 +417,39 @@ class DuQuantFusedW4Linear(DuQuantPackedW4Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_t = self._input_transform(x)
+        act_backend = os.environ.get("OPENPI_DUQUANT_ACT_BACKEND", "fake").strip().lower()
 
-        # Preserve parent A4/A8 activation fake quant semantics.
-        if self.act_bits > 0 and self.act_bits < 16:
-            s_a = self._get_act_scale(x_t, self.act_bits)
-            x_t = fake_quantize_sym(x_t, s_a, self.act_bits, label="activation_forward")
+        if act_backend in {"real", "real_w4a", "kernel"} and self.act_bits in {4, 8 ,16}:
+            if self.cfg.row_rot_mode == "restore" and self.pack.R_out_blocks is not None:
+                bias = self._bias
+                r_out_stack = self._r_out_stack
+            else:
+                bias = self._bias_rot if getattr(self, "_bias_rot", None) is not None else self._bias
+                r_out_stack = None
+
+            return real_w4a_linear_triton(
+                x_t,
+                self._qweight_packed,
+                self._w_scales,
+                act_bits=self.act_bits,
+                in_features=self.in_features,
+                out_features=self.out_features,
+                r_out_stack=r_out_stack,
+                bias=bias,
+                block_out_size=self._block_out_size,
+            )
+        
+        if self.act_bits > 0 and self.act_bits <= 16:
+            act_mode = os.environ.get(
+                "OPENPI_DUQUANT_ACT_QUANT_MODE",
+                "dynamic_token_amax",
+            ).strip().lower()
+            x_t = fake_quantize_act_dynamic(
+                x_t,
+                self.act_bits,
+                mode=act_mode,
+                label="activation_forward",
+            )
 
         if self.cfg.row_rot_mode == "restore" and self.pack.R_out_blocks is not None:
             bias = self._bias
