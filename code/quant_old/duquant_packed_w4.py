@@ -40,11 +40,10 @@ except Exception:
     _HAS_TRITON = False
 
 
-from openpi.models_pytorch.quant.duquant_layers import DuQuantLinear
-from openpi.models_pytorch.quant.duquant_preprocess import (
+from openpi.models_pytorch.quant_old.duquant_layers import DuQuantLinear
+from openpi.models_pytorch.quant_old.duquant_preprocess import (
     apply_input_transform_optimized,
     apply_output_restore_optimized,
-    fake_quantize_activation,
     fake_quantize_sym,
     qmax,
     transform_weight_for_forward_optimized,
@@ -552,7 +551,7 @@ class DuQuantPackedW4Linear(nn.Module):
             self._qweight_packed.copy_(q.to(device=self._qweight_packed.device, dtype=torch.uint8))
             self._w_scales.copy_(s.to(device=self._w_scales.device, dtype=self._w_scales.dtype))
 
-            # print(f"[PACKED-W4-CACHE] loaded {self.name} from {q_path.parent}", flush=True)
+            print(f"[PACKED-W4-CACHE] loaded {self.name} from {q_path.parent}", flush=True)
             return True
 
         except Exception as e:
@@ -617,7 +616,6 @@ class DuQuantPackedW4Linear(nn.Module):
             R_out_cache=base._get_R_out_cache(),
             block_size=base._block_size,
             block_out_size=base._block_out_size,
-            swc=float(getattr(base.cfg, "swc", 1.0)),
         )
 
         if W_t.shape != (self.out_features, self.in_features):
@@ -715,14 +713,9 @@ class DuQuantPackedW4Linear(nn.Module):
             self._block_size,
         )
 
-        # Reference DuQuant activation semantics.  The real speedup here is the
-        # packed W4 weight kernel, not an activation kernel.
-        x_t = fake_quantize_activation(
-            x_t,
-            self.act_bits,
-            lac=float(getattr(self.cfg, "lac", 1.0)),
-            group_size=int(getattr(self.cfg, "act_group_size", 0)),
-        )
+        if self.act_bits > 0 and self.act_bits < 16:
+            s_a = self._get_act_scale(x_t, self.act_bits)
+            x_t = fake_quantize_sym(x_t, s_a, self.act_bits, label="activation_forward")
 
         if self.forward_backend == "kernel":
             y = self._linear_kernel(x_t)
@@ -732,13 +725,19 @@ class DuQuantPackedW4Linear(nn.Module):
             raise ValueError(f"Unknown OPENPI_DUQUANT_PACKED_BACKEND={self.forward_backend}")
 
         if self.cfg.row_rot_mode == "restore" and self.pack.R_out_blocks is not None:
-            y = apply_output_restore_optimized(y, self.pack, self._get_R_out_cache(), self._block_out_size)
+            y = apply_output_restore_optimized(
+                y,
+                self.pack,
+                self._get_R_out_cache(),
+                self._block_out_size,
+            )
             if self._bias is not None:
                 y = y + self._bias.to(dtype=y.dtype, device=y.device)
         else:
             if self._bias is not None:
                 bias = self._bias_rot if self._bias_rot is not None else self._bias
                 y = y + bias.to(dtype=y.dtype, device=y.device)
+
         return y
 
 
@@ -754,9 +753,9 @@ def convert_duquant_to_packed_w4(model: nn.Module) -> int:
         if isinstance(module, DuQuantLinear):
             targets.append(name)
 
-    # print(f"[PACKED-W4] Found DuQuantLinear layers: {len(targets)}", flush=True)
-    # print(f"[PACKED-W4] backend={os.environ.get('OPENPI_DUQUANT_PACKED_BACKEND', 'kernel')}", flush=True)
-    # print(f"[PACKED-W4] int4_cache={_get_default_int4_cache_dir()} enabled={_int4_cache_enabled()}", flush=True)
+    print(f"[PACKED-W4] Found DuQuantLinear layers: {len(targets)}", flush=True)
+    print(f"[PACKED-W4] backend={os.environ.get('OPENPI_DUQUANT_PACKED_BACKEND', 'kernel')}", flush=True)
+    print(f"[PACKED-W4] int4_cache={_get_default_int4_cache_dir()} enabled={_int4_cache_enabled()}", flush=True)
 
     replaced = 0
     t_all = time.perf_counter()

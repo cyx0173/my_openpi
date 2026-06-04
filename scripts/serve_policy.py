@@ -2,8 +2,6 @@ import sys
 import os
 os.environ["OPENPI_DATA_HOME"] = "/share/chengyuxuan-local/openpi" #所有的文件不要乱放 全部放在这个/share文件夹下面
 #线形层量化
-os.environ.setdefault("OPENPI_DUQUANT_PACKDIR", "/home/chengyuxuan/openpi/src/openpi/models_pytorch/quant/duquant_packed")  # SVD 分解缓存目录
-os.environ["OPENPI_DUQUANT_ACT_SCALE_MODE"] = "dynamic_amax"
 #os.environ["OPENPI_DUQUANT_STAGED"] = "1"  # Whether to quantize in stages (True) or all at once (False).
 # action model量化 atm ohb
 #os.environ["OPENPI_ATM_ENABLE"] = "0"

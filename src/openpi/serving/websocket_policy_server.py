@@ -69,11 +69,13 @@ class WebsocketPolicyServer:
                 infer_start = time.perf_counter()
 
                 noise = None
+                tag = None
                 if isinstance(obs, dict):
                     noise = obs.pop("debug_noise", None)
+                    tag = obs.pop("debug_collect_tag", None)
 
                 self._infer_count += 1
-                action = self._policy.infer(obs, noise=noise)
+                action = self._policy.infer(obs, noise=noise, tag=tag)
 
                 infer_time = time.perf_counter() - infer_start
 

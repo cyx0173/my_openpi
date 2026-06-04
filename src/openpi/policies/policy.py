@@ -66,7 +66,7 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None, tag: str | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -88,6 +88,9 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+    
+        if tag is not None:
+            sample_kwargs["tag"] = tag
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
@@ -102,15 +105,6 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
-   #     model_obj = getattr(self, "_model", None)
-   #     if model_obj is None:
-   #         model_obj = getattr(self, "model", None)
-
-   #     meta = getattr(model_obj, "_last_vlm_feature_meta", None)
-   #     if meta is not None:
-   #         outputs["vlm_feature_path"] = meta.get("path", "")
-   #         outputs["vlm_feature_meta"] = meta
-
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

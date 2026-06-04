@@ -1,85 +1,60 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
-import time
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
-
 DEFAULT_PACK_DIR = os.environ.get("OPENPI_DUQUANT_PACKDIR", "./duquant_packed")
+
+
+def qmax(bits: int) -> int:
+    return (1 << (int(bits) - 1)) - 1
+
+
+def _block_count(dim: int, block_size: int) -> int:
+    return (int(dim) + int(block_size) - 1) // int(block_size)
+
+
+def sanitize_name(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(name))
+    return name.replace("..", ".")
 
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def sanitize_name(name: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
-    return name.replace("..", ".")
+def _pack_path(layer_name: str, pack_dir: Optional[str]) -> str:
+    path = pack_dir or DEFAULT_PACK_DIR
+    _ensure_dir(path)
+    return os.path.join(path, f"{sanitize_name(layer_name)}.npz")
 
 
-def qmax(bits: int) -> int:
-    return (1 << (bits - 1)) - 1
+@dataclass
+class PackResult:
+    """Reference DuQuant transform package for one Linear layer.
 
+    This file deliberately contains no packed INT4 kernel state.  It stores only
+    the mathematically lossless pre-quantization transforms:
 
-class _DuQuantProfiler:
-    def __init__(self) -> None:
-        self.enabled = os.environ.get("OPENPI_DUQUANT_PROFILE", "0") not in ("0", "false", "False")
-        self.sync_cuda = os.environ.get("OPENPI_DUQUANT_PROFILE_SYNC", "1") not in ("0", "false", "False")
-        self._stats = defaultdict(lambda: {"time": 0.0, "count": 0.0, "elements": 0.0, "bytes": 0.0})
-        if self.enabled:
-            import atexit
-            atexit.register(self.report)
+      x' = x[:, perm] @ R_in
+      W' = W[:, perm] @ R_in
+      optional row rotation W'' = R_out @ W', followed by y @ R_out restore
 
-    def record(self, label: str, tensor: torch.Tensor, scale: torch.Tensor, bits: int, fn):
-        if not self.enabled:
-            return fn()
+    The quantized Linear module then fake-quantizes W'' and x' in a slow but
+    easy-to-verify reference path.
+    """
 
-        devices = []
-        if self.sync_cuda:
-            if tensor.is_cuda:
-                devices.append(tensor.device)
-            if isinstance(scale, torch.Tensor) and scale.is_cuda:
-                devices.append(scale.device)
-
-        for d in devices:
-            torch.cuda.synchronize(d)
-        start = time.perf_counter()
-        out = fn()
-        for d in devices:
-            torch.cuda.synchronize(d)
-        elapsed = time.perf_counter() - start
-
-        st = self._stats[label]
-        st["time"] += elapsed
-        st["count"] += 1
-        st["elements"] += tensor.numel()
-        st["bytes"] += tensor.numel() * tensor.element_size()
-        if isinstance(scale, torch.Tensor):
-            st["bytes"] += scale.numel() * scale.element_size()
-        st["bits"] = float(bits)
-        return out
-
-    def report(self) -> None:
-        if not self.enabled:
-            return
-        print("=" * 100)
-        print("[OPENPI-DUQUANT][PROFILE] fake quantization summary")
-        for label, st in sorted(self._stats.items()):
-            calls = int(st["count"])
-            total_ms = st["time"] * 1000
-            avg_ms = total_ms / max(calls, 1)
-            print(f"{label:<28} calls={calls:<8d} total_ms={total_ms:10.2f} avg_ms={avg_ms:8.3f}")
-        print("=" * 100)
-
-
-_DUQUANT_PROFILER = _DuQuantProfiler()
+    R_in_blocks: Optional[Dict[int, np.ndarray]]
+    perm: Optional[np.ndarray]
+    R_out_blocks: Optional[Dict[int, np.ndarray]]
+    meta: Dict[str, Any]
 
 
 def fake_quantize_sym(
@@ -89,221 +64,314 @@ def fake_quantize_sym(
     *,
     label: Optional[str] = None,
 ) -> torch.Tensor:
-    """
-    Symmetric fake quantization used for weight quantization.
-
-    Quantize/dequantize arithmetic is always executed in FP32 to avoid BF16/FP16
-    round(x / scale) artifacts. The returned tensor keeps the original dtype.
-    """
-    if bits <= 0:
-        return x
-
-    def _impl() -> torch.Tensor:
-        max_q = qmax(bits)
-        x_fp32 = x.to(torch.float32)
-        scale_safe = torch.clamp(
-            scale.to(device=x.device, dtype=torch.float32),
-            min=1e-12,
-        )
-        q = torch.round(x_fp32 / scale_safe)
-        q = torch.clamp(q, -max_q - 1, max_q)
-        y = q * scale_safe
-        return y.to(dtype=x.dtype)
-
-    return _DUQUANT_PROFILER.record(label or "fake_quantize_sym", x, scale, bits, _impl)
-
-
-def fake_quantize_act_dynamic(
-    x: torch.Tensor,
-    bits: int,
-    *,
-    mode: str = "dynamic_token_amax",
-    label: Optional[str] = None,
-) -> torch.Tensor:
-    """
-    Stateless dynamic activation fake quantization.
-
-    Mainline mode:
-      dynamic_token_amax / token_amax / per_token_amax
-
-    Semantics:
-      - A4/A8 use per-token absmax scale computed from the current activation.
-      - Quantize/dequantize arithmetic is FP32.
-      - A16 and higher bypass activation fake quantization.
-      - No calibration buffer, running scale, or first-request cache is used.
-    """
+    """Symmetric fake quantization, always using FP32 arithmetic internally."""
+    del label
+    bits = int(bits)
     if bits <= 0 or bits >= 16:
         return x
 
-    def _impl() -> torch.Tensor:
-        mode_l = str(mode).strip().lower()
-        if mode_l not in {"dynamic_token_amax", "token_amax", "per_token_amax"}:
-            raise ValueError(f"Unknown OPENPI_DUQUANT_ACT_QUANT_MODE={mode}")
+    max_q = qmax(bits)
+    x_fp32 = x.to(torch.float32)
+    s = torch.clamp(scale.to(device=x.device, dtype=torch.float32), min=1e-12)
+    q = torch.round(x_fp32 / s)
+    q = torch.clamp(q, -max_q - 1, max_q)
+    return (q * s).to(dtype=x.dtype)
 
-        max_q = qmax(bits)
-        x_fp32 = x.to(torch.float32)
+
+def fake_quantize_activation(
+    x: torch.Tensor,
+    bits: int,
+    *,
+    lac: float = 1.0,
+    group_size: int = 0,
+) -> torch.Tensor:
+    """DuQuant-style runtime activation fake quantization after transform.
+
+    DuQuant still uses dynamic activation quantization during forward; the
+    critical calibration-dependent part is the preceding permutation/rotation
+    and smoothing/clipping configuration.  This function supports per-token and
+    per-token-group scales with LAC-style clipping.
+    """
+    bits = int(bits)
+    if bits <= 0 or bits >= 16:
+        return x
+
+    if not (0.0 < float(lac) <= 1.0):
+        raise ValueError(f"lac/activation clip ratio must be in (0, 1], got {lac}")
+
+    max_q = qmax(bits)
+    x_fp32 = x.to(torch.float32)
+
+    if int(group_size) <= 0:
         p = torch.amax(torch.abs(x_fp32), dim=-1, keepdim=True)
-        scale = torch.clamp(p / max_q, min=1e-12)
-        q = torch.round(x_fp32 / scale)
+        clip = torch.clamp(p * float(lac), min=1e-12)
+        q = torch.round(torch.clamp(x_fp32, -clip, clip) / (clip / max_q))
         q = torch.clamp(q, -max_q - 1, max_q)
-        y = q * scale
-        return y.to(dtype=x.dtype)
+        return (q * (clip / max_q)).to(dtype=x.dtype)
 
-    return _DUQUANT_PROFILER.record(label or "fake_quantize_act_dynamic", x, x, bits, _impl)
+    g = int(group_size)
+    c = int(x_fp32.shape[-1])
+    pad = (g - c % g) % g
+    if pad:
+        x_pad = torch.nn.functional.pad(x_fp32, (0, pad))
+    else:
+        x_pad = x_fp32
 
-
-@dataclass
-class PackResult:
-    R_in_blocks: Optional[Dict[int, np.ndarray]]
-    perm: Optional[np.ndarray]
-    R_out_blocks: Optional[Dict[int, np.ndarray]]
-    weight_scale: np.ndarray
-    meta: Dict[str, Any]
-
-
-def _block_count(dim: int, block_size: int) -> int:
-    return (dim + block_size - 1) // block_size
-
-
-def compute_block_rotation(W_block: np.ndarray) -> np.ndarray:
-    """
-    Compute an orthonormal rotation matrix for one input/output block.
-    """
-    x = W_block.T
-    b = x.shape[0]
-    try:
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        x_t = torch.from_numpy(x.astype(np.float32)).to(dev)
-        u, _, _ = torch.linalg.svd(x_t, full_matrices=True)
-        u_np = u.cpu().numpy().astype(np.float64)
-    except Exception:
-        try:
-            u_np, _, _ = np.linalg.svd(x.astype(np.float64, copy=False), full_matrices=True)
-        except np.linalg.LinAlgError:
-            u_np = np.eye(b, dtype=np.float64)
-
-    if u_np.shape[1] < b:
-        pad = np.zeros((b, b - u_np.shape[1]), dtype=u_np.dtype)
-        u_np = np.concatenate([u_np, pad], axis=1)
-    return u_np[:, :b]
+    new_c = int(x_pad.shape[-1])
+    xg = x_pad.reshape(*x_pad.shape[:-1], new_c // g, g)
+    p = torch.amax(torch.abs(xg), dim=-1, keepdim=True)
+    clip = torch.clamp(p * float(lac), min=1e-12)
+    scale = clip / max_q
+    q = torch.round(torch.clamp(xg, -clip, clip) / scale)
+    q = torch.clamp(q, -max_q - 1, max_q)
+    y = (q * scale).reshape(*x_pad.shape)
+    if pad:
+        y = y[..., :c]
+    return y.to(dtype=x.dtype)
 
 
-def zigzag_permutation(energy: np.ndarray) -> np.ndarray:
-    order = np.argsort(-energy)
+def compute_mse_scales(W: torch.Tensor, bits: int, *, swc: float = 1.0) -> torch.Tensor:
+    """Per-output-channel symmetric quant scales with a small MSE grid search."""
+    bits = int(bits)
+    if bits <= 0 or bits >= 16:
+        return torch.ones(W.shape[0], device=W.device, dtype=W.dtype)
+
+    if not (0.0 < float(swc) <= 1.0):
+        raise ValueError(f"swc/weight clip ratio must be in (0, 1], got {swc}")
+
+    max_q = qmax(bits)
+    W32 = W.to(torch.float32)
+    max_abs = torch.amax(torch.abs(W32), dim=1).clamp_min(1e-8) * float(swc)
+    base = max_abs / max_q
+
+    # This is intentionally small and deterministic; it is a reference path.
+    multipliers = torch.tensor([0.50, 0.75, 1.00, 1.25, 1.50], device=W.device, dtype=torch.float32)
+    candidates = base[:, None] * multipliers[None, :]
+    W_row = W32[:, None, :]
+    S = candidates[:, :, None].clamp_min(1e-12)
+    q = torch.round(W_row / S).clamp(-max_q - 1, max_q)
+    rec = q * S
+    mse = torch.mean((rec - W_row) ** 2, dim=2)
+    idx = torch.argmin(mse, dim=1)
+    return candidates[torch.arange(W.shape[0], device=W.device), idx].to(dtype=W.dtype)
+
+
+def _is_power_of_two(x: int) -> bool:
+    x = int(x)
+    return x > 0 and (x & (x - 1)) == 0
+
+
+def _hadamard(n: int) -> np.ndarray:
+    """Normalized Sylvester Hadamard matrix for power-of-two n."""
+    if not _is_power_of_two(n):
+        raise ValueError(f"Hadamard size must be power of two, got {n}")
+    H = np.array([[1.0]], dtype=np.float64)
+    while H.shape[0] < n:
+        H = np.block([[H, H], [H, -H]])
+    return H / math.sqrt(float(n))
+
+
+def _deterministic_orthogonal(n: int, *, seed: int) -> np.ndarray:
+    if n <= 1:
+        return np.eye(n, dtype=np.float64)
+    if _is_power_of_two(n):
+        return _hadamard(n)
+    rng = np.random.default_rng(int(seed))
+    A = rng.standard_normal((n, n)).astype(np.float64)
+    Q, R = np.linalg.qr(A)
+    signs = np.sign(np.diag(R))
+    signs[signs == 0] = 1
+    return Q * signs[None, :]
+
+
+def zigzag_permutation(score: np.ndarray) -> np.ndarray:
+    """Spread high-outlier channels across the hidden dimension."""
+    score = np.asarray(score, dtype=np.float64).reshape(-1)
+    order = np.argsort(-score)
+    out = np.empty_like(order)
     left, right = 0, len(order) - 1
-    perm = []
-    toggle = True
-    while left <= right:
-        if toggle:
-            perm.append(order[left])
+    for i, idx in enumerate(order):
+        if i % 2 == 0:
+            out[left] = idx
             left += 1
         else:
-            perm.append(order[right])
+            out[right] = idx
             right -= 1
-        toggle = not toggle
-    return np.array(perm, dtype=np.int64)
+    return out.astype(np.int64)
+
+
+def _hash_array_head(x: Optional[np.ndarray]) -> str:
+    if x is None:
+        return "none"
+    import hashlib
+
+    a = np.asarray(x, dtype=np.float32).reshape(-1)
+    head = a[: min(a.size, 4096)]
+    return hashlib.sha1(head.tobytes()).hexdigest()[:16]
+
+
+def _calib_score(
+    *,
+    in_features: int,
+    act_absmax: Optional[torch.Tensor | np.ndarray],
+    act_std: Optional[torch.Tensor | np.ndarray] = None,
+    require_calib: bool,
+) -> np.ndarray:
+    if act_absmax is None:
+        if require_calib:
+            raise RuntimeError(
+                "Missing DuQuant calibration for this layer. Run activation calibration first "
+                "and set OPENPI_DUQUANT_CALIB_PATH to the generated .pt file."
+            )
+        return np.ones((in_features,), dtype=np.float64)
+
+    if isinstance(act_absmax, torch.Tensor):
+        absmax = act_absmax.detach().to(torch.float32).cpu().numpy()
+    else:
+        absmax = np.asarray(act_absmax, dtype=np.float32)
+    absmax = absmax.reshape(-1).astype(np.float64)
+    if absmax.size != in_features:
+        raise ValueError(f"activation stat size mismatch: expected {in_features}, got {absmax.size}")
+
+    score = absmax.copy()
+    if act_std is not None:
+        if isinstance(act_std, torch.Tensor):
+            std = act_std.detach().to(torch.float32).cpu().numpy()
+        else:
+            std = np.asarray(act_std, dtype=np.float32)
+        std = std.reshape(-1).astype(np.float64)
+        if std.size == in_features:
+            # Blend massive-outlier prior and normal dynamic spread.
+            score = 0.75 * score + 0.25 * std
+
+    score = np.nan_to_num(score, nan=0.0, posinf=np.finfo(np.float32).max, neginf=0.0)
+    return np.maximum(score, 1e-12)
 
 
 def pack_weight(
     W: torch.Tensor,
     *,
-    block_size: int = 64,
+    layer_name: str,
+    act_absmax: Optional[torch.Tensor | np.ndarray],
+    act_std: Optional[torch.Tensor | np.ndarray] = None,
+    block_size: int = 128,
     block_out_size: Optional[int] = None,
     enable_permute: bool = True,
-    lambda_smooth: float = 0.15,
+    require_calib: bool = True,
+    alpha: float = 0.6,
+    permutation_times: int = 1,
+    row_rot_mode: str = "restore",
 ) -> PackResult:
+    """Build a calibration-driven DuQuant reference transform.
+
+    Important difference from the old local code: the permutation is driven by
+    activation calibration statistics rather than by weight-only energy.
     """
-    DuQuant-style preprocessing:
-      1. input-channel energy smoothing
-      2. zigzag permutation
-      3. input block rotation
-      4. output row block rotation
-    """
+    del alpha  # Reserved for future SmoothQuant-style folding at norm/linear boundaries.
+
     W_np = W.detach().to(dtype=torch.float32, device="cpu").numpy()
     out_features, in_features = W_np.shape
+    block_size = int(block_size)
+    if block_out_size is None:
+        block_out_size = block_size
+    block_out_size = int(block_out_size)
 
-    channel_energy = np.mean(W_np ** 2, axis=0)
-    if lambda_smooth > 0:
-        mean_e = float(channel_energy.mean())
-        channel_energy = (1.0 - lambda_smooth) * channel_energy + lambda_smooth * mean_e
+    score = _calib_score(
+        in_features=in_features,
+        act_absmax=act_absmax,
+        act_std=act_std,
+        require_calib=require_calib,
+    )
 
-    perm = zigzag_permutation(channel_energy) if enable_permute else None
+    perm: Optional[np.ndarray]
+    if enable_permute:
+        perm = np.arange(in_features, dtype=np.int64)
+        cur_score = score.copy()
+        for _ in range(max(int(permutation_times), 1)):
+            p = zigzag_permutation(cur_score)
+            perm = perm[p]
+            cur_score = cur_score[p]
+    else:
+        perm = None
 
-    R_in_blocks: Dict[int, np.ndarray] = {}
+    # Input rotations: outlier-aware by first spreading channels via calibrated
+    # zigzag permutation, then using full-mixing orthogonal blocks.
     n_in_blocks = _block_count(in_features, block_size)
+    R_in_blocks: Dict[int, np.ndarray] = {}
     for b in range(n_in_blocks):
         s = b * block_size
         e = min((b + 1) * block_size, in_features)
-        cols = np.arange(s, e)
-        if perm is not None:
-            cols = perm[cols]
-        W_block = W_np[:, cols]
-        R_in_blocks[b] = compute_block_rotation(W_block)
+        width = e - s
+        R_in_blocks[b] = _deterministic_orthogonal(width, seed=17_003 + b).astype(np.float32)
 
-    if block_out_size is None:
-        block_out_size = block_size
-
-    R_out_blocks: Dict[int, np.ndarray] = {}
-    n_out_blocks = _block_count(out_features, block_out_size)
-    for b in range(n_out_blocks):
-        s = b * block_out_size
-        e = min((b + 1) * block_out_size, out_features)
-        W_rows = W_np[s:e, :]
-        R_out_blocks[b] = compute_block_rotation(W_rows.T)
-
-    max_abs = np.maximum(np.max(np.abs(W_np), axis=1), 1e-8)
-    weight_scale = (max_abs / qmax(4)).astype(np.float32)
+    R_out_blocks: Optional[Dict[int, np.ndarray]] = None
+    if str(row_rot_mode).lower() == "restore":
+        n_out_blocks = _block_count(out_features, block_out_size)
+        R_out_blocks = {}
+        for b in range(n_out_blocks):
+            s = b * block_out_size
+            e = min((b + 1) * block_out_size, out_features)
+            width = e - s
+            R_out_blocks[b] = _deterministic_orthogonal(width, seed=29_011 + b).astype(np.float32)
 
     meta = {
+        "format": "openpi_duquant_reference_v1",
+        "layer_name": str(layer_name),
         "in_features": int(in_features),
         "out_features": int(out_features),
         "block_size": int(block_size),
         "block_out_size": int(block_out_size),
         "enable_permute": bool(enable_permute),
-        "lambda_smooth": float(lambda_smooth),
+        "require_calib": bool(require_calib),
+        "permutation_times": int(permutation_times),
+        "row_rot_mode": str(row_rot_mode),
+        "calib_score_hash": _hash_array_head(score),
     }
-
-    return PackResult(
-        R_in_blocks=R_in_blocks or None,
-        perm=perm,
-        R_out_blocks=R_out_blocks or None,
-        weight_scale=weight_scale,
-        meta=meta,
-    )
-
-
-def _pack_path(layer_name: str, pack_dir: Optional[str]) -> str:
-    path = pack_dir or DEFAULT_PACK_DIR
-    _ensure_dir(path)
-    return os.path.join(path, f"{sanitize_name(layer_name)}.npz")
+    return PackResult(R_in_blocks=R_in_blocks, perm=perm, R_out_blocks=R_out_blocks, meta=meta)
 
 
 def save_pack(layer_name: str, pack: PackResult, pack_dir: Optional[str]) -> None:
     path = _pack_path(layer_name, pack_dir)
-    data: Dict[str, Any] = {
-        "weight_scale": pack.weight_scale.astype(np.float32),
-        "meta": json.dumps(pack.meta),
-    }
+    data: Dict[str, Any] = {"meta": json.dumps(pack.meta, sort_keys=True)}
     if pack.perm is not None:
         data["perm"] = pack.perm.astype(np.int64)
     if pack.R_in_blocks:
         data["R_in_blocks"] = np.array(sorted(pack.R_in_blocks.keys()), dtype=np.int64)
         for b, R in pack.R_in_blocks.items():
-            data[f"Rin_{b}"] = R.astype(np.float32)
+            data[f"Rin_{int(b)}"] = R.astype(np.float32)
     if pack.R_out_blocks:
         data["R_out_blocks"] = np.array(sorted(pack.R_out_blocks.keys()), dtype=np.int64)
         for b, R in pack.R_out_blocks.items():
-            data[f"Rout_{b}"] = R.astype(np.float32)
+            data[f"Rout_{int(b)}"] = R.astype(np.float32)
     np.savez(path, **data)
 
 
-def load_pack(layer_name: str, pack_dir: Optional[str]) -> Optional[PackResult]:
+def _meta_matches(saved: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    keys = [
+        "format",
+        "layer_name",
+        "in_features",
+        "out_features",
+        "block_size",
+        "block_out_size",
+        "enable_permute",
+        "require_calib",
+        "permutation_times",
+        "row_rot_mode",
+        "calib_score_hash",
+    ]
+    return all(saved.get(k) == expected.get(k) for k in keys)
+
+
+def load_pack(layer_name: str, pack_dir: Optional[str], *, expected_meta: Optional[Dict[str, Any]] = None) -> Optional[PackResult]:
     path = _pack_path(layer_name, pack_dir)
     if not os.path.exists(path):
         return None
 
     with np.load(path, allow_pickle=False) as f:
         meta = json.loads(f["meta"].tolist()) if "meta" in f.files else {}
+        if expected_meta is not None and not _meta_matches(meta, expected_meta):
+            return None
         perm = f["perm"] if "perm" in f.files else None
 
         R_in_blocks = None
@@ -318,31 +386,7 @@ def load_pack(layer_name: str, pack_dir: Optional[str]) -> Optional[PackResult]:
             for b in f["R_out_blocks"]:
                 R_out_blocks[int(b)] = f[f"Rout_{int(b)}"]
 
-        return PackResult(
-            R_in_blocks=R_in_blocks,
-            perm=perm,
-            R_out_blocks=R_out_blocks,
-            weight_scale=f["weight_scale"],
-            meta=meta,
-        )
-
-
-def compute_mse_scales(W: torch.Tensor, bits: int) -> torch.Tensor:
-    if bits <= 0 or bits >= 16:
-        return torch.ones(W.shape[0], device=W.device, dtype=W.dtype)
-
-    max_abs = torch.amax(torch.abs(W), dim=1).clamp_min(1e-8)
-    base = max_abs / qmax(bits)
-    alphas = torch.tensor([0.5, 0.75, 1.0, 1.25, 1.5], device=W.device, dtype=W.dtype)
-    candidates = base[:, None] / alphas[None, :]
-
-    W_row = W[:, None, :]
-    S = candidates[:, :, None]
-    q = torch.round(W_row / S).clamp(-qmax(bits) - 1, qmax(bits))
-    rec = q * S
-    mse = torch.mean((rec - W_row) ** 2, dim=2)
-    idx = torch.argmin(mse, dim=1)
-    return candidates[torch.arange(W.shape[0], device=W.device), idx]
+    return PackResult(R_in_blocks=R_in_blocks, perm=perm, R_out_blocks=R_out_blocks, meta=meta)
 
 
 def apply_input_transform_optimized(
@@ -355,28 +399,25 @@ def apply_input_transform_optimized(
     if perm_cache is None and not R_in_cache:
         return x
 
-    in_features = x.shape[-1]
-
+    in_features = int(x.shape[-1])
     if perm_cache is not None:
-        x = x.index_select(dim=-1, index=perm_cache.to(x.device))
+        x = x.index_select(dim=-1, index=perm_cache.to(device=x.device))
 
-    if R_in_cache:
-        orig_shape = x.shape
-        x_view = x.reshape(-1, in_features)
-        x_out = x_view.clone()
-        n_blocks = _block_count(in_features, block_size)
+    if not R_in_cache:
+        return x
 
-        for b in range(n_blocks):
-            if b not in R_in_cache:
-                continue
-            s = b * block_size
-            e = min((b + 1) * block_size, in_features)
-            R = R_in_cache[b][: e - s, : e - s].to(dtype=x_view.dtype, device=x_view.device)
-            x_out[:, s:e] = x_view[:, s:e] @ R
-
-        x = x_out.reshape(orig_shape)
-
-    return x
+    orig_shape = x.shape
+    x_view = x.reshape(-1, in_features)
+    x_out = x_view.clone()
+    n_blocks = _block_count(in_features, block_size)
+    for b in range(n_blocks):
+        if b not in R_in_cache:
+            continue
+        s = b * int(block_size)
+        e = min((b + 1) * int(block_size), in_features)
+        R = R_in_cache[b][: e - s, : e - s].to(dtype=x_view.dtype, device=x_view.device)
+        x_out[:, s:e] = x_view[:, s:e] @ R
+    return x_out.reshape(orig_shape)
 
 
 def transform_weight_for_forward_optimized(
@@ -390,36 +431,36 @@ def transform_weight_for_forward_optimized(
     R_out_cache: Dict[int, torch.Tensor],
     block_size: int,
     block_out_size: int,
+    swc: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if perm_cache is not None:
         W_t = W.index_select(dim=1, index=perm_cache.to(W.device)).clone()
     else:
         W_t = W.clone()
 
-    in_features = W_t.shape[1]
-
+    in_features = int(W_t.shape[1])
     if R_in_cache:
         n_blocks = _block_count(in_features, block_size)
         for b in range(n_blocks):
             if b not in R_in_cache:
                 continue
-            s = b * block_size
-            e = min((b + 1) * block_size, in_features)
+            s = b * int(block_size)
+            e = min((b + 1) * int(block_size), in_features)
             R = R_in_cache[b][: e - s, : e - s].to(dtype=W_t.dtype, device=W_t.device)
             W_t[:, s:e] = W_t[:, s:e] @ R
 
     if apply_row_rot and R_out_cache:
-        out_features = W_t.shape[0]
+        out_features = int(W_t.shape[0])
         n_blocks = _block_count(out_features, block_out_size)
         for b in range(n_blocks):
             if b not in R_out_cache:
                 continue
-            s = b * block_out_size
-            e = min((b + 1) * block_out_size, out_features)
+            s = b * int(block_out_size)
+            e = min((b + 1) * int(block_out_size), out_features)
             R = R_out_cache[b][: e - s, : e - s].to(dtype=W_t.dtype, device=W_t.device)
             W_t[s:e, :] = R @ W_t[s:e, :]
 
-    scales = compute_mse_scales(W_t, weight_bits)
+    scales = compute_mse_scales(W_t, weight_bits, swc=swc)
     return W_t, scales
 
 
@@ -429,23 +470,21 @@ def apply_output_restore_optimized(
     R_out_cache: Dict[int, torch.Tensor],
     block_out_size: int,
 ) -> torch.Tensor:
+    del pack
     if not R_out_cache:
         return y
-
-    out_features = y.shape[-1]
+    out_features = int(y.shape[-1])
     orig_shape = y.shape
     y_view = y.reshape(-1, out_features)
     y_out = y_view.clone()
-
     n_blocks = _block_count(out_features, block_out_size)
     for b in range(n_blocks):
         if b not in R_out_cache:
             continue
-        s = b * block_out_size
-        e = min((b + 1) * block_out_size, out_features)
+        s = b * int(block_out_size)
+        e = min((b + 1) * int(block_out_size), out_features)
         R = R_out_cache[b][: e - s, : e - s].to(dtype=y_view.dtype, device=y_view.device)
         y_out[:, s:e] = y_view[:, s:e] @ R
-
     return y_out.reshape(orig_shape)
 
 
@@ -455,19 +494,17 @@ def apply_bias_row_rot_optimized(
     R_out_cache: Dict[int, torch.Tensor],
     block_out_size: int,
 ) -> torch.Tensor:
+    del pack
     if not R_out_cache:
         return bias
-
-    out_features = bias.shape[-1]
+    out_features = int(bias.shape[-1])
     bias_out = bias.clone()
     n_blocks = _block_count(out_features, block_out_size)
-
     for b in range(n_blocks):
         if b not in R_out_cache:
             continue
-        s = b * block_out_size
-        e = min((b + 1) * block_out_size, out_features)
+        s = b * int(block_out_size)
+        e = min((b + 1) * int(block_out_size), out_features)
         R = R_out_cache[b][: e - s, : e - s].to(dtype=bias.dtype, device=bias.device)
         bias_out[s:e] = R @ bias[s:e]
-
     return bias_out

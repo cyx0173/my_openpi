@@ -76,7 +76,7 @@ class Args:
         "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
-    num_trials_per_task: int = 5  # Number of rollouts per task
+    num_trials_per_task: int = 1  # Number of rollouts per task
 
     #################################################################################################################
     # Utils
@@ -105,7 +105,7 @@ def eval_libero(args: Args) -> None:
     elif args.task_suite_name == "libero_goal":
         max_steps = 300  # longest training demo has 270 steps
     elif args.task_suite_name == "libero_10":
-        max_steps = 320  # longest training demo has 505 steps
+        max_steps = 520  # longest training demo has 505 steps
     elif args.task_suite_name == "libero_90":
         max_steps = 400  # longest training demo has 373 steps
     else:
@@ -182,8 +182,18 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        t0 = time.perf_counter()
+                        response = client.infer(element)
+                        client_infer_ms = (time.perf_counter() - t0) * 1000.0
+                        action_chunk = response["actions"]
                         action_chunk_np = np.asarray(action_chunk)
+                        server_timing = response.get("server_timing", {})
+                        server_infer_ms = server_timing.get("infer_ms", None)
+                        print(
+                            f"server_infer={server_infer_ms:.2f} ms "
+                            f"client_roundtrip={client_infer_ms:.2f} ms",
+                            flush=True,
+                        )
 
                         _append_action_chunk_jsonl(
                             "/home/chengyuxuan/openpi/lab_track/atm_1/action_chunks_1.jsonl",

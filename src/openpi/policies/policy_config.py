@@ -11,8 +11,7 @@ import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
-from openpi.policies.quantvla import _enable_openpi_duquant_staged, _debug_duquant_state
-from openpi.models_pytorch.quant import convert_duquant_to_packed_w4
+from openpi.policies.quantvla import _enable_openpi_duquant_staged, _debug_duquant_state, _calibrate_openpi_duquant_staged
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -56,7 +55,24 @@ def create_trained_policy(
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
 
         if quantize:
-            _enable_openpi_duquant_staged(model)
+            wbits = int(os.environ.get("OPENPI_DUQUANT_WBITS_DEFAULT", "4"))
+            abits = int(os.environ.get("OPENPI_DUQUANT_ABITS", "4"))
+            print(f"[OPENPI] Quantizing with wbits={wbits}, abits={abits}", flush=True)
+            if abits not in {2, 4, 8, 16}:
+                raise ValueError(f"Unsupported OPENPI_DUQUANT_ABITS={abits}")
+            from openpi.policies.quantvla import (
+                _enable_openpi_duquant_staged,
+                _enable_openpi_smoothvla_staged,
+            )
+
+            quant_backend = os.environ.get("OPENPI_QUANT_BACKEND", "duquant").strip().lower()
+
+            if quant_backend in {"smoothvla", "smoothquant", "smooth_w4", "sq_w4"}:
+                model = _enable_openpi_smoothvla_staged(model)
+            else:
+                model = _enable_openpi_duquant_staged(model, wbits=wbits, abits=abits)
+        else:
+            _calibrate_openpi_duquant_staged(model)
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)

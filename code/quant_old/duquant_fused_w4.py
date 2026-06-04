@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 from torch import nn
-
+from openpi.models_pytorch.quant_old.duquant_real_w4a import real_w4a_linear_triton
 try:
     import triton
     import triton.language as tl
@@ -17,24 +17,34 @@ except Exception:
     tl = None
     _HAS_TRITON = False
 
-from openpi.models_pytorch.quant.duquant_layers import DuQuantLinear
-from openpi.models_pytorch.quant.duquant_preprocess import (
+
+from openpi.models_pytorch.quant_old.duquant_layers import DuQuantLinear
+from openpi.models_pytorch.quant_old.duquant_preprocess import (
     apply_input_transform_optimized,
-    fake_quantize_activation,
+    fake_quantize_act_dynamic,
 )
-from openpi.models_pytorch.quant.duquant_packed_w4 import (
+from openpi.models_pytorch.quant_old.duquant_packed_w4 import (
     DuQuantPackedW4Linear,
     _get_parent_module_and_attr,
 )
 
 
+# Fixed production tile parameters.
+# Keep these hardcoded for clean benchmarking.
 FUSED_W4_BLOCK_M = 32
 FUSED_W4_BLOCK_K = 128
 
 
+# --------------------------------------------------------------------------------------
+# R stack builders
+# --------------------------------------------------------------------------------------
+
+
 def _make_r_in_stack(module: nn.Module) -> Optional[torch.Tensor]:
+    """Build R_in_stack with shape [num_blocks, block_size, block_size]."""
     if not hasattr(module, "_R_in_block_indices"):
         return None
+
     indices = list(getattr(module, "_R_in_block_indices", []))
     if not indices:
         return None
@@ -45,8 +55,9 @@ def _make_r_in_stack(module: nn.Module) -> Optional[torch.Tensor]:
 
     first = getattr(module, f"_R_in_{indices[0]}")
     stack = torch.zeros((num_blocks, block, block), dtype=first.dtype, device=first.device)
-    diag = torch.arange(block, device=first.device)
+
     for b in range(num_blocks):
+        diag = torch.arange(block, device=first.device)
         stack[b, diag, diag] = 1.0
 
     for b in indices:
@@ -59,8 +70,10 @@ def _make_r_in_stack(module: nn.Module) -> Optional[torch.Tensor]:
 
 
 def _make_r_out_stack(module: nn.Module) -> Optional[torch.Tensor]:
+    """Build R_out_stack with shape [num_blocks, block_out_size, block_out_size]."""
     if not hasattr(module, "_R_out_block_indices"):
         return None
+
     indices = list(getattr(module, "_R_out_block_indices", []))
     if not indices:
         return None
@@ -71,8 +84,9 @@ def _make_r_out_stack(module: nn.Module) -> Optional[torch.Tensor]:
 
     first = getattr(module, f"_R_out_{indices[0]}")
     stack = torch.zeros((num_blocks, block, block), dtype=first.dtype, device=first.device)
-    diag = torch.arange(block, device=first.device)
+
     for b in range(num_blocks):
+        diag = torch.arange(block, device=first.device)
         stack[b, diag, diag] = 1.0
 
     for b in indices:
@@ -84,6 +98,11 @@ def _make_r_out_stack(module: nn.Module) -> Optional[torch.Tensor]:
     return stack.contiguous()
 
 
+# --------------------------------------------------------------------------------------
+# Batched input transform
+# --------------------------------------------------------------------------------------
+
+
 def apply_input_transform_batched_fast(
     x: torch.Tensor,
     perm_cache: Optional[torch.Tensor],
@@ -91,7 +110,14 @@ def apply_input_transform_batched_fast(
     block_size: int,
     in_features: int,
 ) -> torch.Tensor:
-    """Fast DuQuant input transform: permutation + one torch.bmm for all R_in blocks."""
+    """
+    DuQuant input transform fast path.
+
+    Equivalent to:
+        x -> optional permutation -> blockwise x_block @ R_in_block
+
+    The block rotation is executed as one torch.bmm instead of many small matmuls.
+    """
     if perm_cache is not None:
         if perm_cache.device != x.device:
             perm_cache = perm_cache.to(device=x.device)
@@ -105,10 +131,11 @@ def apply_input_transform_batched_fast(
         raise ValueError(f"x last dim={orig_shape[-1]} but in_features={in_features}")
 
     x2d = x.reshape(-1, in_features).contiguous()
-    m = int(x2d.shape[0])
+    m = x2d.shape[0]
 
     num_blocks = int(r_in_stack.shape[0])
     padded_features = num_blocks * int(block_size)
+
     if padded_features < in_features:
         raise ValueError(
             f"invalid padded_features={padded_features}, in_features={in_features}, "
@@ -118,6 +145,7 @@ def apply_input_transform_batched_fast(
     if padded_features != in_features:
         x2d = torch.nn.functional.pad(x2d, (0, padded_features - in_features))
 
+    # [M, num_blocks, block] -> [num_blocks, M, block]
     xb = x2d.reshape(m, num_blocks, block_size).transpose(0, 1).contiguous()
 
     r = r_in_stack
@@ -126,6 +154,7 @@ def apply_input_transform_batched_fast(
     if r.dtype != xb.dtype:
         r = r.to(dtype=xb.dtype)
 
+    # [num_blocks, M, block] @ [num_blocks, block, block]
     yb = torch.bmm(xb, r)
     y2d = yb.transpose(0, 1).contiguous().reshape(m, padded_features)
 
@@ -134,6 +163,10 @@ def apply_input_transform_batched_fast(
 
     return y2d.reshape(orig_shape)
 
+
+# --------------------------------------------------------------------------------------
+# Triton kernel: packed W4 GEMM + output restore + bias
+# --------------------------------------------------------------------------------------
 
 if _HAS_TRITON:
 
@@ -174,6 +207,8 @@ if _HAS_TRITON:
             ).to(tl.float16)
 
             byte_idx = k // 2
+
+            # QW layout: [N, ceil(K / 2)]
             packed = tl.load(
                 QW + offs_n[None, :] * KPACK + byte_idx[:, None],
                 mask=(offs_n[None, :] < N) & (byte_idx[:, None] < KPACK) & (k[:, None] < K),
@@ -185,12 +220,15 @@ if _HAS_TRITON:
             use_high = (k[:, None] & 1) == 1
             q_u = tl.where(use_high, high, low)
 
+            # unsigned nibble [0, 15] -> signed int4 [-8, 7]
             q = (q_u.to(tl.float32) - 8.0).to(tl.float16)
+
             scales = tl.load(S + offs_n, mask=offs_n < N, other=0.0).to(tl.float16)
             w = q * scales[None, :]
 
             acc += tl.dot(a, w)
 
+        # Output restore: y_block @ R_out
         if HAS_RESTORE:
             r_i = tl.arange(0, BLOCK_N)
             r_j = tl.arange(0, BLOCK_N)
@@ -223,12 +261,21 @@ def fused_w4_linear_triton(
     bias: Optional[torch.Tensor],
     block_out_size: int,
 ) -> torch.Tensor:
-    """Packed W4 GEMM + optional R_out restore + optional bias in one Triton path."""
+    """
+    Fused W4 path after activation handling:
+        y_raw = X @ dequant(W4).T
+        y = y_raw @ R_out   if restore exists
+        y = y + bias        if bias exists
+
+    For A4/A8, X has already been fake-quantized/dequantized before this call.
+    For A16, X is the normal transformed activation.
+    """
     if not _HAS_TRITON:
         raise RuntimeError("Triton is not available for fused W4 backend.")
 
     if x_t.shape[-1] != in_features:
         raise ValueError(f"x last dim={x_t.shape[-1]} but in_features={in_features}")
+
     if qweight_packed.dtype != torch.uint8:
         raise TypeError(f"qweight_packed must be uint8, got {qweight_packed.dtype}")
 
@@ -246,6 +293,7 @@ def fused_w4_linear_triton(
     block_n = int(block_out_size)
     block_m = FUSED_W4_BLOCK_M
     block_k = FUSED_W4_BLOCK_K
+
     if k < block_k:
         block_k = 64 if k >= 64 else 32
 
@@ -292,13 +340,22 @@ def fused_w4_linear_triton(
     return y2d.reshape(*orig_shape, n)
 
 
-class DuQuantFusedW4Linear(DuQuantPackedW4Linear):
-    """Fast fused W4 module.
+# --------------------------------------------------------------------------------------
+# Fused module
+# --------------------------------------------------------------------------------------
 
-    Keeps calibrated DuQuant pack + packed W4 weight, and accelerates forward with:
-      1. batched R_in input transform,
-      2. packed W4 Triton GEMM,
-      3. fused R_out restore + bias.
+
+class DuQuantFusedW4Linear(DuQuantPackedW4Linear):
+    """
+    Fused W4 module.
+
+    A4/A8/A16 all use:
+        batched input transform
+        optional activation fake quant for A4/A8
+        fused W4 GEMM + output restore + bias
+
+    This preserves A4/A8 fake quant semantics while avoiding the parent path's
+    old input transform and output restore overhead.
     """
 
     def __init__(self, base: DuQuantLinear):
@@ -336,6 +393,7 @@ class DuQuantFusedW4Linear(DuQuantPackedW4Linear):
 
     @property
     def weight(self):
+        # Compatibility-only fake weight tensor. Does not allocate full float weight.
         return self._weight_compat_storage.as_strided((self.out_features, self.in_features), (0, 0))
 
     def _input_transform(self, x: torch.Tensor) -> torch.Tensor:
@@ -348,6 +406,7 @@ class DuQuantFusedW4Linear(DuQuantPackedW4Linear):
                 self.in_features,
             )
         except Exception:
+            # Silent safe fallback to original implementation.
             return apply_input_transform_optimized(
                 x,
                 self.pack,
@@ -358,13 +417,39 @@ class DuQuantFusedW4Linear(DuQuantPackedW4Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_t = self._input_transform(x)
+        act_backend = os.environ.get("OPENPI_DUQUANT_ACT_BACKEND", "fake").strip().lower()
 
-        x_t = fake_quantize_activation(
-            x_t,
-            self.act_bits,
-            lac=float(getattr(self.cfg, "lac", 1.0)),
-            group_size=int(getattr(self.cfg, "act_group_size", 0)),
-        )
+        if act_backend in {"real", "real_w4a", "kernel"} and self.act_bits in {4, 8 ,16}:
+            if self.cfg.row_rot_mode == "restore" and self.pack.R_out_blocks is not None:
+                bias = self._bias
+                r_out_stack = self._r_out_stack
+            else:
+                bias = self._bias_rot if getattr(self, "_bias_rot", None) is not None else self._bias
+                r_out_stack = None
+
+            return real_w4a_linear_triton(
+                x_t,
+                self._qweight_packed,
+                self._w_scales,
+                act_bits=self.act_bits,
+                in_features=self.in_features,
+                out_features=self.out_features,
+                r_out_stack=r_out_stack,
+                bias=bias,
+                block_out_size=self._block_out_size,
+            )
+        
+        if self.act_bits > 0 and self.act_bits <= 16:
+            act_mode = os.environ.get(
+                "OPENPI_DUQUANT_ACT_QUANT_MODE",
+                "dynamic_token_amax",
+            ).strip().lower()
+            x_t = fake_quantize_act_dynamic(
+                x_t,
+                self.act_bits,
+                mode=act_mode,
+                label="activation_forward",
+            )
 
         if self.cfg.row_rot_mode == "restore" and self.pack.R_out_blocks is not None:
             bias = self._bias
@@ -384,94 +469,11 @@ class DuQuantFusedW4Linear(DuQuantPackedW4Linear):
             block_out_size=self._block_out_size,
         )
 
-@torch.no_grad()
-def warmup_fused_w4_kernels(model: nn.Module, *, max_layers: int = 0) -> int:
-    """Warm up CUDA DuQuant fused W4 modules.
-
-    Only warm modules whose packed W4 buffers are already on CUDA.
-    If conversion happens before the model is moved to GPU, CPU modules are
-    skipped silently instead of calling Triton with CPU pointers.
-    """
-    enabled = os.environ.get("OPENPI_DUQUANT_FUSED_WARMUP", "1").lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-    if not enabled:
-        print("[FUSED-W4-WARMUP] skipped by OPENPI_DUQUANT_FUSED_WARMUP=0", flush=True)
-        return 0
-
-    warmed = 0
-    skipped_cpu = 0
-    failed = 0
-
-    print(
-        "[FUSED-W4-WARMUP] start "
-        f"triton_cache_dir={os.environ.get('TRITON_CACHE_DIR')}",
-        flush=True,
-    )
-
-    was_training = model.training
-    model.eval()
-
-    for name, module in model.named_modules():
-        if not isinstance(module, DuQuantFusedW4Linear):
-            continue
-
-        qweight = getattr(module, "_qweight_packed", None)
-        scales = getattr(module, "_w_scales", None)
-
-        if not isinstance(qweight, torch.Tensor) or not isinstance(scales, torch.Tensor):
-            failed += 1
-            print(f"[FUSED-W4-WARMUP][WARN] missing buffers layer={name}", flush=True)
-            continue
-
-        # Triton CUDA kernels cannot run on CPU tensors.
-        if not qweight.is_cuda or not scales.is_cuda:
-            skipped_cpu += 1
-            continue
-
-        device = qweight.device
-        dtype = scales.dtype if scales.dtype.is_floating_point else torch.bfloat16
-
-        x = torch.zeros(
-            (1, int(module.in_features)),
-            device=device,
-            dtype=dtype,
-        )
-
-        try:
-            _ = module(x)
-            warmed += 1
-        except Exception as e:
-            failed += 1
-            print(
-                f"[FUSED-W4-WARMUP][WARN] failed layer={name}: {type(e).__name__}: {repr(e)}",
-                flush=True,
-            )
-
-        del x
-
-        if max_layers > 0 and warmed >= int(max_layers):
-            break
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    if was_training:
-        model.train()
-
-    print(
-        "[FUSED-W4-WARMUP] done "
-        f"warmed_layers={warmed} skipped_cpu_layers={skipped_cpu} failed_layers={failed}",
-        flush=True,
-    )
-    return warmed
 
 def convert_duquant_to_fused_w4(model: nn.Module) -> int:
+    """Convert all DuQuantLinear modules into DuQuantFusedW4Linear."""
     targets = [name for name, module in model.named_modules() if isinstance(module, DuQuantLinear)]
+
     print(f"[FUSED-W4] Found DuQuantLinear layers: {len(targets)}", flush=True)
 
     replaced = 0
@@ -504,9 +506,6 @@ def convert_duquant_to_fused_w4(model: nn.Module) -> int:
         f"[FUSED-W4] Converted layers: {replaced}, total_dt={time.perf_counter() - t_all:.2f}s",
         flush=True,
     )
-
-    max_warmup = int(os.environ.get("OPENPI_DUQUANT_FUSED_WARMUP_MAX_LAYERS", "0"))
-    warmup_fused_w4_kernels(model, max_layers=max_warmup)
 
     return replaced
 
