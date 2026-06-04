@@ -192,3 +192,21 @@ experiments/baseline/
 experiments/**/w4a4_action_bank/
 experiments/**/videos/
 experiments/**/logs/
+
+# QuantVLA generated data
+experiments/smooth/
+experiments/selector_dataset/
+experiments/**/w4a4_action_bank/
+experiments/**/w4a8_action_bank/
+experiments/**/w4a16_action_bank/
+experiments/**/recovery_schedules/
+experiments/**/logs/
+
+# generated model / calibration / rollout artifacts
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.mp4
+*.jsonl
