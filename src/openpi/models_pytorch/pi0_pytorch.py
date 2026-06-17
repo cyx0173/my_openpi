@@ -13,7 +13,11 @@ import numpy as np
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-
+from openpi.models_pytorch.quant_selector import ModulewiseABitsController
+from openpi.models_pytorch.quant_selector import PrecisionSelector 
+SELECTOR_CKPT_PATH = (
+    "/home/chengyuxuan/openpi/experiments/selector_dataset/model/selector.pt"
+)
 def _parse_selector_tag(tag: str) -> tuple[str, int]:
     tag = str(tag)
     m = re.fullmatch(r"(.+)__midprefix_(w4a4|w4a8|w4a16)__chunk(\d+)", tag)
@@ -43,10 +47,7 @@ def _mid_path_from_tag(tag: str) -> Path:
     case_id, chunk_idx, midprefix_precision = _parse_selector_tag_full(tag)
 
     root = Path(
-        os.environ.get(
-            "OPENPI_SELECTOR_DATASET_ROOT",
-            "/share/chengyuxuan-local/openpi/recovery_data_selector",
-        )
+        "/share/chengyuxuan-local/openpi/selector/recovery_data_selector"
     )
 
     if midprefix_precision is not None:
@@ -61,37 +62,120 @@ def _mid_path_from_tag(tag: str) -> Path:
 
     # 旧单路 mid 保存到 mid_single，避免和 mid/w4a4,w4a8,w4a16 混在一起
     return root / "cases" / case_id / "mid_single" / f"chunk{chunk_idx:04d}.npz"
-    
+
+PRECISION_TO_BITS = {
+    "w4a4": 4,
+    "w4a8": 8,
+    "w4a16": 16,
+}
+
+BITS_TO_LABEL = {
+    4: 0,
+    8: 1,
+    16: 2,
+}
+def _bits_to_label_or_neg(bits: int | None) -> int:
+    if bits is None:
+        return -1
+    bits = int(bits)
+    return int(BITS_TO_LABEL.get(bits, -1))
+
 def _save_vlm_prefix_raw(
     *,
     tag: str,
-    vlm_prefix_last_hidden: torch.Tensor,
-    prefix_pad_mask: torch.Tensor,
+    selector_context_tokens: torch.Tensor,
+    selector_context_mask: torch.Tensor,
+    state: torch.Tensor | None = None,
+    requested_vlm_a_bits: int | None = None,
+    requested_action_a_bits: int | None = None,
 ) -> None:
     out_path = _mid_path_from_tag(tag)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    hidden = vlm_prefix_last_hidden.detach().float().cpu().numpy()
-    mask = prefix_pad_mask.detach().cpu().numpy()
+    ctx = selector_context_tokens.detach().float().cpu().numpy()
+    mask = selector_context_mask.detach().cpu().numpy()
 
-    # rollout 时 batch 基本是 1，直接去掉 batch 维
-    if hidden.shape[0] == 1:
-        hidden = hidden[0]
+    if ctx.shape[0] == 1:
+        ctx = ctx[0]
     if mask.shape[0] == 1:
         mask = mask[0]
 
+    state_np = None
+    if state is not None:
+        state_np = state.detach().float().cpu().numpy()
+        if state_np.shape[0] == 1:
+            state_np = state_np[0]
+
     case_id, chunk_idx, midprefix_precision = _parse_selector_tag_full(tag)
 
-    np.savez_compressed(
-        out_path,
-        vlm_prefix_last_hidden=hidden.astype(np.float16),
-        prefix_pad_mask=mask.astype(np.bool_),
-        chunk_idx=np.asarray(chunk_idx, dtype=np.int64),
-        case_id=np.asarray(case_id),
-        current_vlm_precision=np.asarray(
-            midprefix_precision if midprefix_precision is not None else "unknown"
-        ),
+    if midprefix_precision is not None:
+        current_vlm_precision = str(midprefix_precision)
+        current_vlm_a_bits = int(PRECISION_TO_BITS[current_vlm_precision])
+    elif requested_vlm_a_bits is not None:
+        current_vlm_a_bits = int(requested_vlm_a_bits)
+        current_vlm_precision = f"w4a{current_vlm_a_bits}"
+    else:
+        current_vlm_a_bits = -1
+        current_vlm_precision = "unknown"
+
+    current_vlm_label_id = _bits_to_label_or_neg(
+        None if current_vlm_a_bits < 0 else current_vlm_a_bits
     )
+
+    payload = {
+        # selector input: prefix_embs from embed_prefix(...)
+        "selector_context_tokens": ctx.astype(np.float16),
+        "selector_context_mask": mask.astype(np.bool_),
+
+        # aliases
+        "prefix_input_embs": ctx.astype(np.float16),
+        "prefix_pad_mask": mask.astype(np.bool_),
+
+        # proprio state
+        "server_state": (
+            state_np.astype(np.float32)
+            if state_np is not None
+            else np.zeros((0,), dtype=np.float32)
+        ),
+        "state": (
+            state_np.astype(np.float32)
+            if state_np is not None
+            else np.zeros((0,), dtype=np.float32)
+        ),
+        "state_dim": np.asarray(
+            -1 if state_np is None else state_np.shape[-1],
+            dtype=np.int64,
+        ),
+
+        # identity
+        "case_id": np.asarray(case_id),
+        "chunk_idx": np.asarray(chunk_idx, dtype=np.int64),
+
+        # current VLM precision context
+        "current_vlm_precision": np.asarray(current_vlm_precision),
+        "current_vlm_a_bits": np.asarray(current_vlm_a_bits, dtype=np.int64),
+        "current_vlm_label_id": np.asarray(current_vlm_label_id, dtype=np.int64),
+
+        # request metadata
+        "requested_vlm_a_bits": np.asarray(
+            -1 if requested_vlm_a_bits is None else int(requested_vlm_a_bits),
+            dtype=np.int64,
+        ),
+        "requested_action_a_bits": np.asarray(
+            -1 if requested_action_a_bits is None else int(requested_action_a_bits),
+            dtype=np.int64,
+        ),
+        "requested_vlm_label_id": np.asarray(
+            _bits_to_label_or_neg(requested_vlm_a_bits),
+            dtype=np.int64,
+        ),
+        "requested_action_label_id": np.asarray(
+            _bits_to_label_or_neg(requested_action_a_bits),
+            dtype=np.int64,
+        ),
+    }
+
+    np.savez_compressed(out_path, **payload)
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "cpu":
@@ -194,6 +278,11 @@ class PI0Pytorch(nn.Module):
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
+        self._modulewise_abits = ModulewiseABitsController(self)
+        self.precision_selector = PrecisionSelector.load(
+            "/home/chengyuxuan/openpi/experiments/selector_dataset/model/selector.pt",
+            device="cuda",
+        )
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
@@ -454,14 +543,20 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad() 
-    def sample_actions(self, device, observation, noise=None,tag = None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None,tag = None, num_steps=10, vlm_a_bits=None, action_a_bits=None,reset = bool(False)) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         self._last_vlm_feature_meta = None
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
-        
+        self._modulewise_abits.set(vlm_a_bits=vlm_a_bits)
+        # if reset:
+        #     vlm_a_bits = 16
+        #     self._modulewise_abits.set(vlm_a_bits=vlm_a_bits)
+        # else:
+        #     vlm_a_bits, action_a_bits = self._modulewise_abits.set()
+        self._modulewise_abits.set(vlm_a_bits=vlm_a_bits)
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
@@ -471,7 +566,7 @@ class PI0Pytorch(nn.Module):
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        
+
         prefix_outputs_embeds, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -479,14 +574,35 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
-        if tag is not None:
-            vlm_prefix_hidden = prefix_outputs_embeds[0]
-            _save_vlm_prefix_raw(
-                tag=tag,
-                vlm_prefix_last_hidden=vlm_prefix_hidden,
-                prefix_pad_mask=prefix_pad_masks,
-            )
+        # if tag is not None:
+        #     _save_vlm_prefix_raw(
+        #         tag=tag,
+        #         selector_context_tokens=prefix_embs,
+        #         selector_context_mask=prefix_pad_masks,
+        #         state=state,
+        #         requested_vlm_a_bits=vlm_a_bits,
+        #         requested_action_a_bits=action_a_bits,
+        #     )
 
+        # selector_out = self.precision_selector.infer(
+        #     selector_context_tokens=prefix_embs,
+        #     selector_context_mask=prefix_pad_masks,
+        #     server_state=state,
+        #     current_vlm_a_bits=vlm_a_bits,
+        # )
+        # action_a_bits = int(selector_out["action_a_bits"])
+        # next_vlm_a_bits = int(selector_out["next_vlm_a_bits"])
+
+        # print(
+        #     "[SELECTOR] "
+        #     f"current_vlm_a_bits={vlm_a_bits} "
+        #     f"selected_pair={selector_out['pair']} "
+        #     f"action_a_bits={action_a_bits} "
+        #     f"next_vlm_a_bits={next_vlm_a_bits}",
+        #     flush=True,
+        # )
+        self._modulewise_abits.set(action_a_bits=action_a_bits) # action expert activation bits
+        
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
@@ -505,6 +621,7 @@ class PI0Pytorch(nn.Module):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+        # self._modulewise_abits.set(vlm_a_bits=next_vlm_a_bits)
         return x_t
 
     def denoise_step(

@@ -1,42 +1,56 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 cd /home/chengyuxuan/openpi
 source start_sh/reset_path.sh
 
-ROOT="/share/chengyuxuan-local/openpi/recovery_data_selector"
+CLIENT_ROOT="${CLIENT_ROOT:-/home/chengyuxuan/openpi/experiments/selector_dataset}"
+SERVER_ROOT="${SERVER_ROOT:-/share/chengyuxuan-local/openpi/selector/recovery_data_selector}"
 
-TASK_JSON="${1:-$ROOT/task_schedule.json}"
+TASK_JSON="${1:-$CLIENT_ROOT/task_schedule.json}"
 
-CLIENT="experiments/mode6_data_selector.py"
-LOG_DIR="/home/chengyuxuan/openpi/experiments/selector_dataset/logs/client"
+# 如果你已经把 clean 版覆盖到 experiments/mode6_data_selector.py，这行可以不改。
+# 否则建议用新的 clean 文件名。
+CLIENT="${CLIENT:-experiments/mode6_data_selector.py}"
+
+LOG_DIR="$CLIENT_ROOT/logs/client"
 mkdir -p "$LOG_DIR"
 
-export OPENPI_SELECTOR_DATASET_ROOT="$ROOT"
-
-SLOTS=(0 1 2 3 4 5 6 7)
+SLOTS=(${SLOTS_OVERRIDE:-0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15})
+BASE_PORT="${BASE_PORT:-8000}"
+HOST="${HOST:-127.0.0.1}"
+FORCE_RERUN="${FORCE_RERUN:-0}"
 
 is_case_done() {
   local case_id="$1"
   local schedule="$2"
 
-  python - "$ROOT" "$case_id" "$schedule" <<'PY'
+  [ "$FORCE_RERUN" = "1" ] && return 1
+
+  python - "$CLIENT_ROOT" "$SERVER_ROOT" "$case_id" "$schedule" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-root = Path(sys.argv[1])
-case_id = sys.argv[2]
-schedule_path = Path(sys.argv[3])
+client_root = Path(sys.argv[1])
+server_root = Path(sys.argv[2])
+case_id = sys.argv[3]
+schedule_path = Path(sys.argv[4])
 
-case_root = root / "cases" / case_id
+client_case_root = client_root / "cases" / case_id
+server_case_root = server_root / "cases" / case_id
+summary_path = client_case_root / "state_summary.json"
 
-# case 目录不存在：没完成
-if not case_root.exists():
+if not summary_path.exists() or summary_path.stat().st_size <= 0:
     sys.exit(1)
 
-# summary 不存在：大概率半成品
-if not (case_root / "state_summary.json").exists():
+try:
+    summary = json.load(open(summary_path, "r", encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+
+# 只跳过完整成功收集的 case。
+if summary.get("success") is not True:
     sys.exit(1)
 
 try:
@@ -44,20 +58,26 @@ try:
 except Exception:
     sys.exit(1)
 
-rows = schedule.get("chunk_schedule") or schedule.get("selector_chunk_schedule") or []
+rows = schedule.get("selector_chunk_schedule") or schedule.get("chunk_schedule") or []
 if not rows:
     sys.exit(1)
 
-for row in rows:
-    k = int(row["chunk_idx"])
+last_chunk = summary.get("last_chunk")
+if last_chunk is None:
+    sys.exit(1)
+last_chunk = int(last_chunk)
 
+needed_chunks = [int(r["chunk_idx"]) for r in rows if int(r["chunk_idx"]) <= last_chunk]
+if not needed_chunks:
+    sys.exit(1)
+
+# 现在只检查 server-side mid 文件，不再检查 client-side state。
+for k in needed_chunks:
     required = [
-        case_root / "state" / f"chunk{k:04d}_state.npz",
-        case_root / "mid" / "w4a4" / f"chunk{k:04d}.npz",
-        case_root / "mid" / "w4a8" / f"chunk{k:04d}.npz",
-        case_root / "mid" / "w4a16" / f"chunk{k:04d}.npz",
+        server_case_root / "mid" / "w4a4" / f"chunk{k:04d}.npz",
+        server_case_root / "mid" / "w4a8" / f"chunk{k:04d}.npz",
+        server_case_root / "mid" / "w4a16" / f"chunk{k:04d}.npz",
     ]
-
     for p in required:
         if not p.exists() or p.stat().st_size <= 0:
             sys.exit(1)
@@ -72,38 +92,114 @@ run_case() {
   local case_id="$3"
   local schedule="$4"
 
-  local port_a4=$((8000 + slot))
-  local port_a8=$((8008 + slot))
-  local port_a16=$((8016 + slot))
-  local ports="${port_a4},${port_a8},${port_a16}"
+  local port=$((BASE_PORT + slot))
+  local log="$LOG_DIR/id${id}_${case_id}.log"
 
-  echo "[LAUNCH] id=${id} case=${case_id} slot=${slot} ports=${ports}"
+  echo "[LAUNCH] id=${id} case=${case_id} slot=${slot} port=${port}"
 
-  uv run python "$CLIENT" "$schedule" --ports "$ports" \
-    > "$LOG_DIR/id${id}_${case_id}.log" 2>&1 &
+  (
+    uv run python "$CLIENT" "$schedule" \
+      --port "$port"
+  ) > "$log" 2>&1 &
+
+  local pid=$!
+  PIDS[$slot]="$pid"
+  CASES[$slot]="$case_id"
+  IDS[$slot]="$id"
 }
 
-slot_i=0
+wait_one() {
+  local done_pid=""
+  local status=0
+
+  set +e
+  wait -n -p done_pid
+  status=$?
+  set -u
+
+  local done_slot=""
+  for slot in "${SLOTS[@]}"; do
+    if [ "${PIDS[$slot]:-}" = "$done_pid" ]; then
+      done_slot="$slot"
+      break
+    fi
+  done
+
+  if [ -z "$done_slot" ]; then
+    echo "[WARN] finished unknown pid=${done_pid:-none} rc=$status"
+    active=$((active - 1))
+    return 0
+  fi
+
+  local case_id="${CASES[$done_slot]}"
+  local id="${IDS[$done_slot]}"
+
+  if [ "$status" -eq 0 ]; then
+    echo "[DONE] id=$id case=$case_id slot=$done_slot pid=$done_pid"
+    finished=$((finished + 1))
+  else
+    echo "[FAIL] id=$id case=$case_id slot=$done_slot pid=$done_pid rc=$status log=$LOG_DIR/id${id}_${case_id}.log"
+    failed=$((failed + 1))
+  fi
+
+  unset PIDS[$done_slot]
+  unset CASES[$done_slot]
+  unset IDS[$done_slot]
+  FREE_SLOTS+=("$done_slot")
+  active=$((active - 1))
+}
+
+declare -a PIDS
+declare -a CASES
+declare -a IDS
+declare -a FREE_SLOTS
+
+for slot in "${SLOTS[@]}"; do
+  FREE_SLOTS+=("$slot")
+done
+
+active=0
+finished=0
+failed=0
+skipped=0
+launched=0
+
+if [ ! -f "$TASK_JSON" ]; then
+  echo "[ERROR] task json not found: $TASK_JSON" >&2
+  exit 1
+fi
+
+if [ ! -f "$CLIENT" ]; then
+  echo "[ERROR] client not found: $CLIENT" >&2
+  exit 1
+fi
+
+echo "[START] client_root=$CLIENT_ROOT"
+echo "[START] server_root=$SERVER_ROOT"
+echo "[START] task_json=$TASK_JSON"
+echo "[START] client=$CLIENT"
+echo "[START] host=$HOST base_port=$BASE_PORT slots=${SLOTS[*]}"
+echo "[START] log_dir=$LOG_DIR"
 
 while IFS=$'\t' read -r id case_id schedule; do
   [ -f "$schedule" ] || continue
 
-  # 关键：先检查是否已经完成。
-  # 完成则跳过，不占用 slot。
   if is_case_done "$case_id" "$schedule"; then
     echo "[SKIP] id=${id} case=${case_id} already complete"
+    skipped=$((skipped + 1))
     continue
   fi
 
-  # 没完成才分配任务
-  run_case "${SLOTS[$slot_i]}" "$id" "$case_id" "$schedule"
+  while [ "${#FREE_SLOTS[@]}" -eq 0 ]; do
+    wait_one
+  done
 
-  slot_i=$((slot_i + 1))
+  slot="${FREE_SLOTS[0]}"
+  FREE_SLOTS=("${FREE_SLOTS[@]:1}")
 
-  if [ "$slot_i" -ge "${#SLOTS[@]}" ]; then
-    wait
-    slot_i=0
-  fi
+  run_case "$slot" "$id" "$case_id" "$schedule"
+  active=$((active + 1))
+  launched=$((launched + 1))
 done < <(
   python - "$TASK_JSON" <<'PY'
 import json
@@ -126,6 +222,8 @@ for new_id, x in enumerate(tasks):
 PY
 )
 
-wait
+while [ "$active" -gt 0 ]; do
+  wait_one
+done
 
-echo "[DONE] all mode6 selector collection jobs finished"
+echo "[SUMMARY] launched=$launched finished=$finished skipped=$skipped failed=$failed"

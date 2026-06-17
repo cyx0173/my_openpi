@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-from openpi.models_pytorch.selector.model import (
+from openpi.models_pytorch.quant_selector.selector.model import (
     StateConditionedQueryDualHeadSelector,
     precision_selector_loss,
 )

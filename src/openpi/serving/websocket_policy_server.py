@@ -73,9 +73,12 @@ class WebsocketPolicyServer:
                 if isinstance(obs, dict):
                     noise = obs.pop("debug_noise", None)
                     tag = obs.pop("debug_collect_tag", None)
+                    vlm_a_bits = obs.pop("vlm_a_bits", None)
+                    action_a_bits = obs.pop("action_a_bits", None)
+                    reset = obs.pop("debug_reset", None)
 
                 self._infer_count += 1
-                action = self._policy.infer(obs, noise=noise, tag=tag)
+                action = self._policy.infer(obs, noise=noise, tag=tag, vlm_a_bits=vlm_a_bits, action_a_bits=action_a_bits,reset=reset)
 
                 infer_time = time.perf_counter() - infer_start
 

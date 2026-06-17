@@ -1,0 +1,68 @@
+========================================================================================================================
+[OVERALL COMPARISON]
+========================================================================================================================
+         precision |              found |            missing |            success |             acc(%) |          avg_steps |  avg_success_steps |         acc@320(%) |         acc@420(%) |         acc@520(%)
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      action_chunk |                500 |                  0 |                440 |              88.00 |             292.45 |             292.45 |              70.40 |              80.60 |              88.00
+
+========================================================================================================================
+[PER-TASK ACCURACY COMPARISON]
+========================================================================================================================
+           task_id |                                                              task_name | action_chunk_found | action_chunk_acc(%) | action_chunk_avg_steps
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+                 0 |          put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket |                 50 |              82.00 |             302.27
+                 1 |             put_both_the_cream_cheese_box_and_the_butter_in_the_basket |                 50 |              98.00 |             278.86
+                 2 |                           turn_on_the_stove_and_put_the_moka_pot_on_it |                 50 |              98.00 |             273.73
+                 3 |    put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it |                 50 |              82.00 |             299.61
+                 4 | put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate |                 50 |              62.00 |             276.29
+                 5 |     pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy |                 50 |              86.00 |             208.93
+                 6 | put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate |                 50 |              98.00 |             263.39
+                 7 |      put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket |                 50 |              92.00 |             281.72
+                 8 |                                        put_both_moka_pots_on_the_stove |                 50 |              90.00 |             432.80
+                 9 |             put_the_yellow_and_white_mug_in_the_microwave_and_close_it |                 50 |              92.00 |             305.09
+
+========================================================================================================================
+[PER-TASK SUCCESS@THRESHOLD COMPARISON]
+========================================================================================================================
+
+[success@320]
+           task_id |                                                              task_name | action_chunk_acc@320(%)
+---------------------------------------------------------------------------------------------------------------------
+                 0 |          put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket |              68.00
+                 1 |             put_both_the_cream_cheese_box_and_the_butter_in_the_basket |              96.00
+                 2 |                           turn_on_the_stove_and_put_the_moka_pot_on_it |              96.00
+                 3 |    put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it |              58.00
+                 4 | put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate |              54.00
+                 5 |     pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy |              84.00
+                 6 | put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate |              94.00
+                 7 |      put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket |              84.00
+                 8 |                                        put_both_moka_pots_on_the_stove |               0.00
+                 9 |             put_the_yellow_and_white_mug_in_the_microwave_and_close_it |              70.00
+
+[success@420]
+           task_id |                                                              task_name | action_chunk_acc@420(%)
+---------------------------------------------------------------------------------------------------------------------
+                 0 |          put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket |              78.00
+                 1 |             put_both_the_cream_cheese_box_and_the_butter_in_the_basket |              98.00
+                 2 |                           turn_on_the_stove_and_put_the_moka_pot_on_it |              98.00
+                 3 |    put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it |              76.00
+                 4 | put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate |              62.00
+                 5 |     pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy |              86.00
+                 6 | put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate |              94.00
+                 7 |      put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket |              92.00
+                 8 |                                        put_both_moka_pots_on_the_stove |              34.00
+                 9 |             put_the_yellow_and_white_mug_in_the_microwave_and_close_it |              88.00
+
+[success@520]
+           task_id |                                                              task_name | action_chunk_acc@520(%)
+---------------------------------------------------------------------------------------------------------------------
+                 0 |          put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket |              82.00
+                 1 |             put_both_the_cream_cheese_box_and_the_butter_in_the_basket |              98.00
+                 2 |                           turn_on_the_stove_and_put_the_moka_pot_on_it |              98.00
+                 3 |    put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it |              82.00
+                 4 | put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate |              62.00
+                 5 |     pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy |              86.00
+                 6 | put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate |              98.00
+                 7 |      put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket |              92.00
+                 8 |                                        put_both_moka_pots_on_the_stove |              90.00
+                 9 |             put_the_yellow_and_white_mug_in_the_microwave_and_close_it |              92.00

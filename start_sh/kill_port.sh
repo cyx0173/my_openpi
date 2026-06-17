@@ -24,4 +24,4 @@ kill_task_ports() {
   kill_port "$((base_port + 2))"
   kill_port "$((base_port + 3))"
 }
-kill_port_range 8000 8032
+kill_port_range 8000 8007

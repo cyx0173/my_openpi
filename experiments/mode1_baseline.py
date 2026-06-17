@@ -74,7 +74,7 @@ _MAX_STEPS = {
     "libero_spatial": 220,
     "libero_object": 280,
     "libero_goal": 300,
-    "libero_10": 600,
+    "libero_10": 520,
     "libero_90": 400,
 }
 
@@ -131,7 +131,7 @@ def _quat2axisangle(quat):
     return (quat[:3] * 2.0 * math.acos(float(quat[3]))) / den
 
 
-def _get_obs_element(obs, task_description: str, resize_size: int):
+def _get_obs_element(obs, task_description: str, resize_size: int , reset = False):
     img_raw = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
     wrist_raw = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
 
@@ -149,13 +149,21 @@ def _get_obs_element(obs, task_description: str, resize_size: int):
             obs["robot0_gripper_qpos"],
         )
     )
-
-    return {
-        "observation/image": img,
-        "observation/wrist_image": wrist_img,
-        "observation/state": state,
-        "prompt": str(task_description),
-    }
+    if reset:
+        return {
+            "observation/image": img,
+            "observation/wrist_image": wrist_img,
+            "observation/state": state,
+            "prompt": str(task_description),
+            "debug_reset": True,
+        }
+    else:
+        return {
+            "observation/image": img,
+            "observation/wrist_image": wrist_img,
+            "observation/state": state,
+            "prompt": str(task_description),
+        }
 
 
 def _get_libero_env(task, resolution: int, seed: int):
@@ -213,7 +221,7 @@ def _add_debug_noise(element: dict, args: Args, task_id: int, episode_idx: int, 
     noise_seed, debug_noise = _make_debug_noise(args, task_id, episode_idx, chunk_idx)
 
     out = dict(element)
-    #out["debug_noise"] = debug_noise.copy()
+    out["debug_noise"] = debug_noise.copy()
 
     return out, {
         "enabled": True,
@@ -252,11 +260,11 @@ def _run_w4a4_episode(
             obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
             t += 1
             continue
-
+        reset = (t == args.num_steps_wait)
         if not action_plan:
             step_start = int(t)
 
-            element = _get_obs_element(obs, task_description, args.resize_size)
+            element = _get_obs_element(obs, task_description, args.resize_size,reset=reset)
             element, noise_meta = _add_debug_noise(
                 element,
                 args=args,

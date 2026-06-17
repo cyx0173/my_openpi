@@ -66,7 +66,7 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None, tag: str | None = None) -> dict:  # type: ignore[misc]
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None, tag: str | None = None, vlm_a_bits: np.ndarray | None = None, action_a_bits: np.ndarray | None = None , reset: bool = False) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -91,6 +91,15 @@ class Policy(BasePolicy):
     
         if tag is not None:
             sample_kwargs["tag"] = tag
+
+        if vlm_a_bits is not None:
+            sample_kwargs["vlm_a_bits"] = vlm_a_bits
+
+        if reset is not None:
+            sample_kwargs["reset"] = reset
+
+        if action_a_bits is not None:
+            sample_kwargs["action_a_bits"] = action_a_bits
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()

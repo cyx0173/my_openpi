@@ -69,6 +69,14 @@ def create_trained_policy(
 
             if quant_backend in {"smoothvla", "smoothquant", "smooth_w4", "sq_w4"}:
                 model = _enable_openpi_smoothvla_staged(model)
+                model._modulewise_abits.build()
+                print(
+                    "[MODULEWISE-ABITS] built "
+                    f"vlm_layers={len(model._modulewise_abits.vlm_layers)} "
+                    f"action_layers={len(model._modulewise_abits.action_layers)} "
+                    f"other_layers={len(model._modulewise_abits.other_layers)}",
+                    flush=True,
+                )
             else:
                 model = _enable_openpi_duquant_staged(model, wbits=wbits, abits=abits)
         else:

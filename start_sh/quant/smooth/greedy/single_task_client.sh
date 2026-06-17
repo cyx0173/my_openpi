@@ -12,6 +12,11 @@ LOG_DIR="$RUN_ROOT/logs/client"
 MASTER_LOG="$LOG_DIR/master.log"
 PID_FILE="$LOG_DIR/master.pid"
 
+# One client uses one serve. 32 serves means 32 slots by default:
+# slot 0 -> BASE_PORT, slot 1 -> BASE_PORT+1, ...
+NUM_SLOTS="${NUM_SLOTS:-40}"
+BASE_PORT="${BASE_PORT:-8000}"
+
 mkdir -p "$OUT_DIR" "$LOG_DIR"
 
 # 默认后台运行；前台调试：
@@ -33,7 +38,11 @@ if [ "${RECOVERY_FOREGROUND:-0}" != "1" ] && [ "${RECOVERY_DAEMONIZED:-0}" != "1
     RUN_ROOT="$RUN_ROOT" \
     FORCE_RERUN="${FORCE_RERUN:-0}" \
     SAVE_VIDEO="${SAVE_VIDEO:-1}" \
-    PARALLEL_TRIALS="${PARALLEL_TRIALS:-1}" \
+    NUM_SLOTS="$NUM_SLOTS" \
+    BASE_PORT="$BASE_PORT" \
+    MAX_STEPS="${MAX_STEPS:-520}" \
+    BASE_SEED="${BASE_SEED:-0}" \
+    STAGNATION_CHUNKS="${STAGNATION_CHUNKS:-10}" \
     bash "$SCRIPT_PATH" "$TASK_JSON" \
     > "$MASTER_LOG" 2>&1 &
 
@@ -110,10 +119,8 @@ except Exception:
     sys.exit(1)
 
 ok = j.get("final_success") is True
-method = (j.get("greedy_meta") or {}).get("method")
-new_method = method == "dynamic_tail_baseline_current_precision_greedy"
 
-sys.exit(0 if ok and new_method else 1)
+sys.exit(0 if ok else 1)
 PY
 }
 
@@ -129,13 +136,11 @@ launch_slot() {
     return 2
   fi
 
-  local a4=$((8000 + slot))
-  local a8=$((8008 + slot))
-  local a16=$((8016 + slot))
+  local port=$((BASE_PORT + slot))
   local video_arg="--save-video"
   [ "${SAVE_VIDEO:-1}" = "0" ] && video_arg="--no-save-video"
 
-  echo "[LAUNCH] id=$idx case=$case slot=$slot ports=$a4,$a8,$a16"
+  echo "[LAUNCH] id=$idx case=$case slot=$slot port=$port"
 
   (
     uv run python "$CLIENT" \
@@ -149,15 +154,7 @@ PY
 ) \
       --out "$OUT_DIR" \
       --policy-host 127.0.0.1 \
-      --port-a4 "$a4" \
-      --port-a8 "$a8" \
-      --port-a16 "$a16" \
-      --parallel-trials "${PARALLEL_TRIALS:-1}" \
-      --monotonic-tail-prune \
-      --greedy-cost-pruning \
-      --save-trial-summary \
-      --save-final-actions \
-      "$video_arg"
+      --policy-port "$port" \
   ) > "$LOG_DIR/${case}.log" 2>&1 &
 
   local pid=$!
@@ -177,15 +174,8 @@ declare -a PIDS
 declare -a CASES
 declare -a IDS
 
-echo "[START] task_json=$TASK_JSON"
-echo "[START] client=$CLIENT"
-echo "[START] run_root=$RUN_ROOT"
-echo "[START] total=$TOTAL"
-echo "[START] save_video=${SAVE_VIDEO:-1}"
-echo "[START] pid=$$"
-
-# 先填满 8 个 slot。
-for slot in 0 1 2 3 4 5 6 7; do
+# 先填满 NUM_SLOTS 个 slot。
+for ((slot=0; slot<NUM_SLOTS; slot++)); do
   while [ "$next_idx" -lt "$TOTAL" ]; do
     launch_slot "$slot" "$next_idx"
     rc=$?
@@ -211,7 +201,7 @@ while [ "$active" -gt 0 ]; do
   status=$?
 
   done_slot=""
-  for slot in 0 1 2 3 4 5 6 7; do
+  for ((slot=0; slot<NUM_SLOTS; slot++)); do
     if [ "${PIDS[$slot]:-}" = "$done_pid" ]; then
       done_slot="$slot"
       break
@@ -259,5 +249,3 @@ while [ "$active" -gt 0 ]; do
   done
 done
 
-echo "[SUMMARY] total=$TOTAL finished=$finished skipped=$skipped failed=$failed"
-echo "[DONE] all jobs finished at $(date)"
